@@ -30,6 +30,11 @@ export class DerbyRoom extends Room<DerbyState> {
   autostartTimeout: NodeJS.Timeout | null = null;
   bots: BotInfo[] = [];
 
+  /** ID del match corrente (usato per idempotenza e log) */
+  matchId: string | null = null;
+  /** Evita invii doppi di premi: chiave = `${sessionId}:${matchId}` */
+  private awardedTokens = new Set<string>();
+
   onCreate() {
     this.setState(new DerbyState());
     this.autoDispose = true;
@@ -69,7 +74,9 @@ export class DerbyRoom extends Room<DerbyState> {
     // Snapshot (mapping sessionId->numero)
     this.onMessage("richiedi_snapshot", (client) => {
       const snap: Array<{ sessionId: string; numero_giocatore: number }> = [];
-      this.state.players.forEach((ps, sid) => snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore }));
+      this.state.players.forEach((ps, sid) =>
+        snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore })
+      );
       client.send("mappa_iniziale", snap);
       console.log("📦 Snapshot inviata a", client.sessionId, snap);
     });
@@ -117,8 +124,14 @@ export class DerbyRoom extends Room<DerbyState> {
     this.lock(); // chiudi room a nuovi ingressi
     this._spawnBotsIfNeeded();
 
+    // Genera e annuncia il matchId per idempotenza/log
+    this.matchId = `${this.roomId}-${Date.now()}`;
+    this.broadcast("match_started", { matchId: this.matchId });
+
     const snap: Array<{ sessionId: string; numero_giocatore: number }> = [];
-    this.state.players.forEach((ps, sid) => snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore }));
+    this.state.players.forEach((ps, sid) =>
+      snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore })
+    );
     this.broadcast("mappa_iniziale", snap);
     console.log("🗺️ Snapshot mapping:", snap);
 
@@ -236,8 +249,27 @@ export class DerbyRoom extends Room<DerbyState> {
   private _fineGara(winnerSid: string, numero: number, tempo: number | null) {
     if (this.matchTerminato) return;
     this.matchTerminato = true;
-    console.log("🏁 Fine gara. Winner:", winnerSid, "Player", numero);
-    this.broadcast("gara_finita", { winner: winnerSid, numero_giocatore: numero, tempo });
+
+    const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`; // fallback prudente
+    console.log("🏁 Fine gara. Winner:", winnerSid, "Player", numero, "matchId:", matchId);
+
+    // Broadcast fine gara con matchId
+    this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
+
+    // Premio solo giocatore umano, una volta sola
+    if (!winnerSid.startsWith("BOT_")) {
+      const token = `${winnerSid}:${matchId}`;
+      if (!this.awardedTokens.has(token)) {
+        this.awardedTokens.add(token);
+        const winnerClient = this.clients.find(c => c.sessionId === winnerSid);
+        if (winnerClient) {
+          const delta = 20; // premio 1° posto confermato
+          winnerClient.send("coins_awarded", { matchId, delta, reason: "win" });
+          console.log(`💰 coins_awarded → ${winnerSid} +${delta} (${matchId})`);
+        }
+      }
+    }
+
     this._clearAllTimers();
     setTimeout(() => this.disconnect(), 1500);
   }
@@ -247,5 +279,9 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
     for (const b of this.bots) if (b.timer) clearInterval(b.timer);
     this.bots = [];
+
+    // reset contesto match/premi
+    this.awardedTokens.clear();
+    this.matchId = null;
   }
 }
