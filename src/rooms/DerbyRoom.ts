@@ -4,10 +4,13 @@ import { Schema, type, MapSchema } from "@colyseus/schema";
 /* =========================
    PlayFab config (ENV)
    ========================= */
-const PF_TITLE_ID = process.env.PLAYFAB_TITLE_ID || "";       // es. "142828"
-const PF_SECRET   = process.env.PLAYFAB_SECRET_KEY || "";     // Title Secret Key
-const PF_CURRENCY = process.env.PLAYFAB_CURRENCY || "GC";     // definiscila in PlayFab Economy
+const PF_TITLE_ID = process.env.PLAYFAB_TITLE_ID || "";      // es. "142828"
+const PF_SECRET   = process.env.PLAYFAB_SECRET_KEY || "";    // Title Secret Key
 const PF_HOST     = PF_TITLE_ID ? `https://${PF_TITLE_ID}.playfabapi.com` : "";
+
+// Valute (primaria = CO, secondaria opzionale = GE)
+const VC_PRIMARY = "CO";
+const VC_SECOND  = "GE";
 
 /* =========================
    State
@@ -174,13 +177,18 @@ export class DerbyRoom extends Room<DerbyState> {
     p.numero_giocatore = numero;
     this.state.players.set(client.sessionId, p);
 
-    // PlayFabId dal client
+    // PlayFabId dal client (per accrediti e sync)
     const pfid = String(options?.playfabId || "");
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
-      // Wallet sync all’ingresso (saldo PlayFab reale)
-      this._pfGetBalance(pfid).then(total => {
-        if (typeof total === "number") client.send("wallet_sync", { total });
+      // Wallet sync all’ingresso: manda CO e GE
+      this._pfGetBalances(pfid).then(vc => {
+        if (vc) {
+          client.send("wallet_sync", {
+            totalCO: vc[VC_PRIMARY] ?? 0,
+            totalGE: vc[VC_SECOND] ?? 0,
+          });
+        }
       }).catch(() => {});
     }
 
@@ -290,7 +298,7 @@ export class DerbyRoom extends Room<DerbyState> {
     // Notifica fine gara a tutti
     this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
 
-    // Premio solo giocatore umano, una volta sola
+    // Premio solo giocatore umano, una volta sola (in CO)
     if (!winnerSid.startsWith("BOT_")) {
       const token = `${winnerSid}:${matchId}`;
       if (!this.awardedTokens.has(token)) {
@@ -298,21 +306,23 @@ export class DerbyRoom extends Room<DerbyState> {
 
         const pfid = this.sid2pf.get(winnerSid);
         if (pfid && PF_HOST && PF_SECRET) {
-          const delta = 20; // premio 1º posto
-          this._pfAddCoins(pfid, delta)
-            .then(newTotal => {
+          const delta = 20; // premio 1º posto in CO
+          this._pfAddCurrency(pfid, VC_PRIMARY, delta)
+            .then(newTotals => {
               const cli = this.clients.find(c => c.sessionId === winnerSid);
               if (cli) {
                 cli.send("coins_awarded", { matchId, delta, reason: "win" });
-                if (typeof newTotal === "number") {
-                  cli.send("wallet_sync", { total: newTotal });
+                if (newTotals) {
+                  cli.send("wallet_sync", {
+                    totalCO: newTotals[VC_PRIMARY] ?? 0,
+                    totalGE: newTotals[VC_SECOND] ?? 0,
+                  });
                 }
               }
-              console.log(`💰 PlayFab +${delta} a ${pfid} (saldo: ${newTotal})`);
+              console.log(`💰 PlayFab +${delta}${VC_PRIMARY} a ${pfid} (saldo: ${newTotals?.[VC_PRIMARY]})`);
             })
             .catch(err => {
               console.error("PlayFab award error", err);
-              // In ogni caso notifica il premio al client (l’HUD può mostrare l’animazione)
               const cli = this.clients.find(c => c.sessionId === winnerSid);
               if (cli) cli.send("coins_awarded", { matchId, delta: 20, reason: "win" });
             });
@@ -343,7 +353,7 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      PlayFab helpers
      ========================= */
-  private async _pfGetBalance(pfid: string): Promise<number | null> {
+  private async _pfGetBalances(pfid: string): Promise<Record<string, number> | null> {
     if (!PF_HOST || !PF_SECRET) return null;
     const res = await fetch(`${PF_HOST}/Server/GetUserInventory`, {
       method: "POST",
@@ -356,22 +366,22 @@ export class DerbyRoom extends Room<DerbyState> {
       return null;
     }
     const vc = json.data?.VirtualCurrency || {};
-    return typeof vc[PF_CURRENCY] === "number" ? vc[PF_CURRENCY] : 0;
+    return vc as Record<string, number>;
   }
 
-  private async _pfAddCoins(pfid: string, amount: number): Promise<number | null> {
+  private async _pfAddCurrency(pfid: string, code: string, amount: number): Promise<Record<string, number> | null> {
     if (!PF_HOST || !PF_SECRET) return null;
     const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: PF_CURRENCY, Amount: amount }),
+      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
     });
     const json = await res.json();
     if (json.code !== 200) {
       console.error("AddUserVirtualCurrency error:", json);
       return null;
     }
-    // rileggi saldo reale
-    return await this._pfGetBalance(pfid);
+    // rileggi tutte le valute dopo l’accredito
+    return await this._pfGetBalances(pfid);
   }
 }
