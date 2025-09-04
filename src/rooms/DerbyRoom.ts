@@ -21,6 +21,7 @@ class PlayerState extends Schema {
   @type("number") y: number = 0;
   @type("number") z: number = 0;
   @type("number") punti: number = 0;
+  @type("string") nickname: string = "";   // opzionale: settato dal client
 }
 
 class DerbyState extends Schema {
@@ -30,19 +31,31 @@ class DerbyState extends Schema {
 type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 
 export class DerbyRoom extends Room<DerbyState> {
+  /* =========================
+     Parametri room
+     ========================= */
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;
+  minimoGiocatori = 1;         // cambia a 2 se vuoi avvio minimo 2 player
   puntiVittoria = 21;
 
+  /* =========================
+     Flag stato runtime
+     ========================= */
   countdownStarted = false;
   matchLanciato = false;
   matchTerminato = false;
   tempoRimanente = this.countdownSeconds;
 
-  interval: NodeJS.Timeout | null = null;
-  autostartTimeout: NodeJS.Timeout | null = null;
+  /* =========================
+     Timer & runtime refs
+     ========================= */
+  interval: NodeJS.Timeout | null = null;          // countdown
+  autostartTimeout: NodeJS.Timeout | null = null;  // avvio automatico dopo join
   bots: BotInfo[] = [];
+
+  leaderboardTimer: NodeJS.Timeout | null = null;  // invio classifica periodico
+  leaderboardDirty = false;                        // debounce per on-change
 
   /** ID del match corrente (usato per idempotenza e log) */
   matchId: string | null = null;
@@ -56,35 +69,56 @@ export class DerbyRoom extends Room<DerbyState> {
     this.autoDispose = true;
     console.log("🏁 Room creata:", this.roomId);
 
-    // POSIZIONE
+    /* ========== MESSAGGI CLIENT -> SERVER ========== */
+
+    // POSIZIONE (x,y,z) aggiornate dal client
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
       if (this.matchTerminato) return;
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
+
       p.x = msg.x; p.y = msg.y; p.z = msg.z;
+
+      // opzionale: broadcast delta posizione (utile per client legacy)
       this.broadcast(
         "pos_update",
         { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z },
         { except: client }
       );
+
+      // segna leaderboard “sporca” per invio rapido
+      this._markLeaderboardDirty();
     });
 
-    // PUNTI
+    // PUNTI aggiornati dal client
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       if (this.matchTerminato) return;
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
+
       const vecchi = p.punti;
       p.punti = nuovi_punti;
       console.log(`🏅 PUNTI ${client.sessionId} (P${p.numero_giocatore}) ${vecchi}→${p.punti}`);
+
       this.broadcast("punteggio_aggiornato", {
         sessionId: client.sessionId,
         numero_giocatore: p.numero_giocatore,
         punti: p.punti,
       });
+
+      this._markLeaderboardDirty();
+
       if (!this.matchTerminato && p.punti >= this.puntiVittoria) {
         this._fineGara(client.sessionId, p.numero_giocatore, null);
       }
+    });
+
+    // Nickname facoltativo (per visual)
+    this.onMessage("set_nickname", (client, nick: string) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+      p.nickname = (nick ?? "").toString().slice(0, 24);
+      this._markLeaderboardDirty();
     });
 
     // Snapshot (mapping sessionId->numero)
@@ -119,15 +153,19 @@ export class DerbyRoom extends Room<DerbyState> {
 
     if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
+      // se la room è piena, avvia subito
       if (this.state.players.size >= this.maxClients) {
         this.lanciaMatch();
         return;
       }
+
       this.tempoRimanente -= 1;
+
       if (this.tempoRimanente >= 0) {
         this.broadcast("countdown_update", this.tempoRimanente);
         console.log(`⏳ Countdown: ${this.tempoRimanente}s`);
       }
+
       if (this.tempoRimanente <= 0) this.lanciaMatch();
     }, 1000);
   }
@@ -158,6 +196,9 @@ export class DerbyRoom extends Room<DerbyState> {
     this.broadcast("inizia_match");
     console.log(`🚦 MATCH INIZIATO (umani:${this.clients.length} bot:${this.bots.length})`);
 
+    // Timer classifica periodico (ogni 300 ms)
+    this._startLeaderboardTicker(300);
+
     setTimeout(() => this._runBots(), 800);
   }
 
@@ -175,6 +216,10 @@ export class DerbyRoom extends Room<DerbyState> {
     const numero = this._assignNumeroGiocatore();
     const p = new PlayerState();
     p.numero_giocatore = numero;
+    // nickname suggerito dal client (opzionale)
+    if (options?.nickname) {
+      p.nickname = String(options.nickname).slice(0, 24);
+    }
     this.state.players.set(client.sessionId, p);
 
     // PlayFabId dal client (per accrediti e sync)
@@ -221,11 +266,19 @@ export class DerbyRoom extends Room<DerbyState> {
     this.state.players.delete(client.sessionId);
     this.sid2pf.delete(client.sessionId);
 
+    // forza un refresh classifica se in countdown (ordine numeri può cambiare)
+    this._markLeaderboardDirty();
+
     if (this.clients.length === 0 && !this.matchTerminato) {
       this._clearAllTimers();
       console.log("🧹 Room vuota, chiudo.");
       this.disconnect();
     }
+  }
+
+  onDispose() {
+    console.log("🧽 onDispose room:", this.roomId);
+    this._clearAllTimers();
   }
 
   private _assignNumeroGiocatore(): number {
@@ -243,12 +296,14 @@ export class DerbyRoom extends Room<DerbyState> {
         const sid = `BOT_${this.roomId}_${i}`;
         const ps = new PlayerState();
         ps.numero_giocatore = i;
+        ps.nickname = `BOT ${i}`;
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
         this.broadcast("giocatore_mappato", { sessionId: sid, numero_giocatore: i });
         console.log(`🤖 BOT creato: ${sid} → Player ${i}`);
       }
     }
+    this._markLeaderboardDirty();
   }
 
   private _runBots() {
@@ -272,6 +327,8 @@ export class DerbyRoom extends Room<DerbyState> {
 
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
         this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
+        this._markLeaderboardDirty();
+
         if (!this.matchTerminato && ps.punti >= this.puntiVittoria) {
           this._fineGara(bot.sid, bot.numero, null);
         }
@@ -286,6 +343,53 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
+     Classifica
+     ========================= */
+  private _startLeaderboardTicker(ms: number) {
+    if (this.leaderboardTimer) clearInterval(this.leaderboardTimer);
+    this.leaderboardTimer = setInterval(() => {
+      if (!this.matchLanciato || this.matchTerminato) return;
+
+      if (this.leaderboardDirty) {
+        this.leaderboardDirty = false;
+        const payload = this._buildLeaderboardPayload();
+        this.broadcast("classifica_update", payload);
+      }
+    }, ms);
+  }
+
+  private _markLeaderboardDirty() {
+    this.leaderboardDirty = true;
+  }
+
+  private _buildLeaderboardPayload(): Array<{
+    sessionId: string;
+    numero_giocatore: number;
+    nickname: string;
+    punti: number;
+    x: number;
+  }> {
+    const list: Array<{ sessionId: string; numero_giocatore: number; nickname: string; punti: number; x: number }> = [];
+    this.state.players.forEach((ps, sid) => {
+      list.push({
+        sessionId: sid,
+        numero_giocatore: ps.numero_giocatore,
+        nickname: ps.nickname || `Player ${ps.numero_giocatore}`,
+        punti: ps.punti,
+        x: ps.x,
+      });
+    });
+
+    // Ordina: punti DESC, poi x DESC
+    list.sort((a, b) => {
+      if (a.punti === b.punti) return b.x - a.x;
+      return b.punti - a.punti;
+    });
+
+    return list;
+  }
+
+  /* =========================
      Fine gara + premi PlayFab
      ========================= */
   private _fineGara(winnerSid: string, numero: number, tempo: number | null) {
@@ -294,6 +398,10 @@ export class DerbyRoom extends Room<DerbyState> {
 
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`; // fallback prudente
     console.log("🏁 Fine gara. Winner:", winnerSid, "Player", numero, "matchId:", matchId);
+
+    // invia classifica finale
+    const finalBoard = this._buildLeaderboardPayload();
+    this.broadcast("classifica_update", finalBoard);
 
     // Notifica fine gara a tutti
     this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
@@ -344,6 +452,9 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
     for (const b of this.bots) if (b.timer) clearInterval(b.timer);
     this.bots = [];
+
+    if (this.leaderboardTimer) { clearInterval(this.leaderboardTimer); this.leaderboardTimer = null; }
+    this.leaderboardDirty = false;
 
     // reset contesto match/premi
     this.awardedTokens.clear();
