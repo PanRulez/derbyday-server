@@ -1,3 +1,4 @@
+// server/DerbyRoom.ts
 import { Room, Client } from "@colyseus/core";
 import { Schema, type, MapSchema } from "@colyseus/schema";
 
@@ -11,6 +12,15 @@ const PF_HOST     = PF_TITLE_ID ? `https://${PF_TITLE_ID}.playfabapi.com` : "";
 // Valute (primaria = CO, secondaria opzionale = GE)
 const VC_PRIMARY = "CO";
 const VC_SECOND  = "GE";
+
+/* =========================
+   Parametri pista (coerenti col client)
+   ========================= */
+// Devi allinearli a Godot:
+// - TRACK_X_START = X di partenza cavalli
+// - STEP_X        = passo_lunghezza del Cavallino (0.20 nel tuo script)
+const TRACK_X_START = 0.0;
+const STEP_X = 0.20;
 
 /* =========================
    State
@@ -36,7 +46,7 @@ export class DerbyRoom extends Room<DerbyState> {
      ========================= */
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;         // cambia a 2 se vuoi avvio minimo 2 player
+  minimoGiocatori = 1;         // alza a 2 se vuoi 2 player minimi
   puntiVittoria = 21;
 
   /* =========================
@@ -71,7 +81,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     /* ========== MESSAGGI CLIENT -> SERVER ========== */
 
-    // POSIZIONE (x,y,z) aggiornate dal client
+    // POSIZIONE (x,y,z) aggiornata dal client umano
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
       if (this.matchTerminato) return;
       const p = this.state.players.get(client.sessionId);
@@ -79,18 +89,17 @@ export class DerbyRoom extends Room<DerbyState> {
 
       p.x = msg.x; p.y = msg.y; p.z = msg.z;
 
-      // opzionale: broadcast delta posizione (utile per client legacy)
+      // Broadcast delta posizione (i client animano gli avversari)
       this.broadcast(
         "pos_update",
         { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z },
         { except: client }
       );
 
-      // segna leaderboard “sporca” per invio rapido
       this._markLeaderboardDirty();
     });
 
-    // PUNTI aggiornati dal client
+    // PUNTI aggiornati dal client umano
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       if (this.matchTerminato) return;
       const p = this.state.players.get(client.sessionId);
@@ -98,13 +107,20 @@ export class DerbyRoom extends Room<DerbyState> {
 
       const vecchi = p.punti;
       p.punti = nuovi_punti;
-      console.log(`🏅 PUNTI ${client.sessionId} (P${p.numero_giocatore}) ${vecchi}→${p.punti}`);
+
+      // (opzionale) se vuoi coerente X=STEP_X*punti anche per umani, scommenta:
+      // p.x = TRACK_X_START + STEP_X * p.punti;
 
       this.broadcast("punteggio_aggiornato", {
         sessionId: client.sessionId,
         numero_giocatore: p.numero_giocatore,
         punti: p.punti,
       });
+
+      // Se aggiorni X lato server per umani, invia anche pos_update:
+      // this.broadcast("pos_update", {
+      //   sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z
+      // });
 
       this._markLeaderboardDirty();
 
@@ -113,7 +129,7 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
-    // Nickname facoltativo (per visual)
+    // Nickname facoltativo
     this.onMessage("set_nickname", (client, nick: string) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -216,6 +232,10 @@ export class DerbyRoom extends Room<DerbyState> {
     const numero = this._assignNumeroGiocatore();
     const p = new PlayerState();
     p.numero_giocatore = numero;
+    p.x = TRACK_X_START; // spawn coerente
+    p.y = 0;
+    p.z = 0;
+
     // nickname suggerito dal client (opzionale)
     if (options?.nickname) {
       p.nickname = String(options.nickname).slice(0, 24);
@@ -297,6 +317,10 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = new PlayerState();
         ps.numero_giocatore = i;
         ps.nickname = `BOT ${i}`;
+        ps.x = TRACK_X_START; // spawn coerente
+        ps.y = 0;
+        ps.z = 0;
+
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
         this.broadcast("giocatore_mappato", { sessionId: sid, numero_giocatore: i });
@@ -321,12 +345,22 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = this.state.players.get(bot.sid);
         if (!ps) return;
 
+        // scelta “passo” pesata
         let r = Math.floor(Math.random() * totalW);
         let pick = 1;
         for (const k of WEIGHTS) { if (r < k.w) { pick = k.s; break; } r -= k.w; }
 
+        // aggiorna punti
+        const prev = ps.punti;
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
+
+        // aggiorna X in base ai punti (autoritative)
+        ps.x = TRACK_X_START + STEP_X * ps.punti;
+
+        // notifica score e posizione
         this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
+        this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
+
         this._markLeaderboardDirty();
 
         if (!this.matchTerminato && ps.punti >= this.puntiVittoria) {
