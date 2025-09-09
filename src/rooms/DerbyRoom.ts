@@ -5,20 +5,19 @@ import { Schema, type, MapSchema } from "@colyseus/schema";
 /* =========================
    PlayFab config (ENV)
    ========================= */
-const PF_TITLE_ID = process.env.PLAYFAB_TITLE_ID || "";      // es. "142828"
-const PF_SECRET   = process.env.PLAYFAB_SECRET_KEY || "";    // Title Secret Key
+const PF_TITLE_ID = process.env.PLAYFAB_TITLE_ID || "";
+const PF_SECRET   = process.env.PLAYFAB_SECRET_KEY || "";
 const PF_HOST     = PF_TITLE_ID ? `https://${PF_TITLE_ID}.playfabapi.com` : "";
 
-// Valute (primaria = CO, secondaria opzionale = GE)
 const VC_PRIMARY = "CO";
 const VC_SECOND  = "GE";
 
 /* =========================
    Parametri pista (coerenti col client)
    ========================= */
-// Devi allinearli a Godot:
-// - TRACK_X_START = X di partenza cavalli
-// - STEP_X        = passo_lunghezza del Cavallino (0.20 nel tuo script)
+// Allinea questi con Godot (Cavallino.gd):
+// - TRACK_X_START = posizione X iniziale dei cavalli
+// - STEP_X        = passo_lunghezza (di default 0.20)
 const TRACK_X_START = 0.0;
 const STEP_X = 0.20;
 
@@ -31,7 +30,7 @@ class PlayerState extends Schema {
   @type("number") y: number = 0;
   @type("number") z: number = 0;
   @type("number") punti: number = 0;
-  @type("string") nickname: string = "";   // opzionale: settato dal client
+  @type("string") nickname: string = "";
 }
 
 class DerbyState extends Schema {
@@ -41,37 +40,25 @@ class DerbyState extends Schema {
 type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 
 export class DerbyRoom extends Room<DerbyState> {
-  /* =========================
-     Parametri room
-     ========================= */
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;         // alza a 2 se vuoi 2 player minimi
+  minimoGiocatori = 1;    // alza a 2 se vuoi 2 player minimi
   puntiVittoria = 21;
 
-  /* =========================
-     Flag stato runtime
-     ========================= */
   countdownStarted = false;
   matchLanciato = false;
   matchTerminato = false;
   tempoRimanente = this.countdownSeconds;
 
-  /* =========================
-     Timer & runtime refs
-     ========================= */
-  interval: NodeJS.Timeout | null = null;          // countdown
-  autostartTimeout: NodeJS.Timeout | null = null;  // avvio automatico dopo join
+  interval: NodeJS.Timeout | null = null;
+  autostartTimeout: NodeJS.Timeout | null = null;
   bots: BotInfo[] = [];
 
-  leaderboardTimer: NodeJS.Timeout | null = null;  // invio classifica periodico
-  leaderboardDirty = false;                        // debounce per on-change
+  leaderboardTimer: NodeJS.Timeout | null = null;
+  leaderboardDirty = false;
 
-  /** ID del match corrente (usato per idempotenza e log) */
   matchId: string | null = null;
-  /** Evita invii doppi di premi: chiave = `${sessionId}:${matchId}` */
   private awardedTokens = new Set<string>();
-  /** Mappa sessionId -> PlayFabId */
   private sid2pf = new Map<string, string>();
 
   onCreate() {
@@ -105,26 +92,29 @@ export class DerbyRoom extends Room<DerbyState> {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      const vecchi = p.punti;
-      p.punti = nuovi_punti;
+      const old = p.punti;
+      p.punti = Math.min(Math.max(nuovi_punti | 0, 0), this.puntiVittoria);
 
-      // (opzionale) se vuoi coerente X=STEP_X*punti anche per umani, scommenta:
-      // p.x = TRACK_X_START + STEP_X * p.punti;
+      // 🔥 Allinea anche la X lato server per coerenza con i bot
+      p.x = TRACK_X_START + STEP_X * p.punti;
 
+      // Notifiche
       this.broadcast("punteggio_aggiornato", {
         sessionId: client.sessionId,
         numero_giocatore: p.numero_giocatore,
         punti: p.punti,
       });
 
-      // Se aggiorni X lato server per umani, invia anche pos_update:
-      // this.broadcast("pos_update", {
-      //   sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z
-      // });
+      // Invia anche la posizione aggiornata (così i remoti lo vedono avanzare)
+      this.broadcast("pos_update", {
+        sessionId: client.sessionId,
+        numero_giocatore: p.numero_giocatore,
+        x: p.x, y: p.y, z: p.z,
+      });
 
       this._markLeaderboardDirty();
 
-      if (!this.matchTerminato && p.punti >= this.puntiVittoria) {
+      if (!this.matchTerminato && p.punti >= this.puntiVittoria && old < this.puntiVittoria) {
         this._fineGara(client.sessionId, p.numero_giocatore, null);
       }
     });
@@ -169,7 +159,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
-      // se la room è piena, avvia subito
       if (this.state.players.size >= this.maxClients) {
         this.lanciaMatch();
         return;
@@ -194,10 +183,9 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
 
-    this.lock(); // chiudi room a nuovi ingressi
+    this.lock();
     this._spawnBotsIfNeeded();
 
-    // matchId per idempotenza/log
     this.matchId = `${this.roomId}-${Date.now()}`;
     this.broadcast("match_started", { matchId: this.matchId });
 
@@ -212,7 +200,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this.broadcast("inizia_match");
     console.log(`🚦 MATCH INIZIATO (umani:${this.clients.length} bot:${this.bots.length})`);
 
-    // Timer classifica periodico (ogni 300 ms)
+    // classifica periodica
     this._startLeaderboardTicker(300);
 
     setTimeout(() => this._runBots(), 800);
@@ -232,21 +220,18 @@ export class DerbyRoom extends Room<DerbyState> {
     const numero = this._assignNumeroGiocatore();
     const p = new PlayerState();
     p.numero_giocatore = numero;
-    p.x = TRACK_X_START; // spawn coerente
+    p.x = TRACK_X_START;
     p.y = 0;
     p.z = 0;
 
-    // nickname suggerito dal client (opzionale)
     if (options?.nickname) {
       p.nickname = String(options.nickname).slice(0, 24);
     }
     this.state.players.set(client.sessionId, p);
 
-    // PlayFabId dal client (per accrediti e sync)
     const pfid = String(options?.playfabId || "");
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
-      // Wallet sync all’ingresso: manda CO e GE
       this._pfGetBalances(pfid).then(vc => {
         if (vc) {
           client.send("wallet_sync", {
@@ -257,14 +242,12 @@ export class DerbyRoom extends Room<DerbyState> {
       }).catch(() => {});
     }
 
-    // broadcast mapping + numero al newcomer
     const snap: Array<{ sessionId: string; numero_giocatore: number }> = [];
     this.state.players.forEach((ps, sid) => snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore }));
     this.broadcast("mappa_iniziale", snap);
     this.broadcast("giocatore_mappato", { sessionId: client.sessionId, numero_giocatore: numero });
     client.send("numero_giocatore", numero);
 
-    // auto start?
     if (this.countdownStarted) {
       client.send("countdown_update", this.tempoRimanente);
     } else {
@@ -286,7 +269,6 @@ export class DerbyRoom extends Room<DerbyState> {
     this.state.players.delete(client.sessionId);
     this.sid2pf.delete(client.sessionId);
 
-    // forza un refresh classifica se in countdown (ordine numeri può cambiare)
     this._markLeaderboardDirty();
 
     if (this.clients.length === 0 && !this.matchTerminato) {
@@ -317,9 +299,7 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = new PlayerState();
         ps.numero_giocatore = i;
         ps.nickname = `BOT ${i}`;
-        ps.x = TRACK_X_START; // spawn coerente
-        ps.y = 0;
-        ps.z = 0;
+        ps.x = TRACK_X_START; ps.y = 0; ps.z = 0;
 
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
@@ -345,25 +325,23 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = this.state.players.get(bot.sid);
         if (!ps) return;
 
-        // scelta “passo” pesata
         let r = Math.floor(Math.random() * totalW);
         let pick = 1;
         for (const k of WEIGHTS) { if (r < k.w) { pick = k.s; break; } r -= k.w; }
 
-        // aggiorna punti
         const prev = ps.punti;
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
 
-        // aggiorna X in base ai punti (autoritative)
+        // Autoritative X basata sui punti
         ps.x = TRACK_X_START + STEP_X * ps.punti;
 
-        // notifica score e posizione
+        // Notifiche score + posizione
         this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
         this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
 
         this._markLeaderboardDirty();
 
-        if (!this.matchTerminato && ps.punti >= this.puntiVittoria) {
+        if (!this.matchTerminato && ps.punti >= this.puntiVittoria && prev < this.puntiVittoria) {
           this._fineGara(bot.sid, bot.numero, null);
         }
       };
@@ -383,7 +361,6 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.leaderboardTimer) clearInterval(this.leaderboardTimer);
     this.leaderboardTimer = setInterval(() => {
       if (!this.matchLanciato || this.matchTerminato) return;
-
       if (this.leaderboardDirty) {
         this.leaderboardDirty = false;
         const payload = this._buildLeaderboardPayload();
@@ -415,11 +392,7 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     // Ordina: punti DESC, poi x DESC
-    list.sort((a, b) => {
-      if (a.punti === b.punti) return b.x - a.x;
-      return b.punti - a.punti;
-    });
-
+    list.sort((a, b) => (a.punti === b.punti ? b.x - a.x : b.punti - a.punti));
     return list;
   }
 
@@ -430,17 +403,14 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.matchTerminato) return;
     this.matchTerminato = true;
 
-    const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`; // fallback prudente
+    const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
     console.log("🏁 Fine gara. Winner:", winnerSid, "Player", numero, "matchId:", matchId);
 
-    // invia classifica finale
     const finalBoard = this._buildLeaderboardPayload();
     this.broadcast("classifica_update", finalBoard);
 
-    // Notifica fine gara a tutti
     this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
 
-    // Premio solo giocatore umano, una volta sola (in CO)
     if (!winnerSid.startsWith("BOT_")) {
       const token = `${winnerSid}:${matchId}`;
       if (!this.awardedTokens.has(token)) {
@@ -448,7 +418,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
         const pfid = this.sid2pf.get(winnerSid);
         if (pfid && PF_HOST && PF_SECRET) {
-          const delta = 20; // premio 1º posto in CO
+          const delta = 20;
           this._pfAddCurrency(pfid, VC_PRIMARY, delta)
             .then(newTotals => {
               const cli = this.clients.find(c => c.sessionId === winnerSid);
@@ -469,7 +439,6 @@ export class DerbyRoom extends Room<DerbyState> {
               if (cli) cli.send("coins_awarded", { matchId, delta: 20, reason: "win" });
             });
         } else {
-          // Env non configurato: fallback notifica locale, senza PlayFab
           const cli = this.clients.find(c => c.sessionId === winnerSid);
           if (cli) cli.send("coins_awarded", { matchId, delta: 20, reason: "win" });
           console.warn("⚠️ PlayFab non configurato: nessun accredito server-side.");
@@ -490,7 +459,6 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.leaderboardTimer) { clearInterval(this.leaderboardTimer); this.leaderboardTimer = null; }
     this.leaderboardDirty = false;
 
-    // reset contesto match/premi
     this.awardedTokens.clear();
     this.matchId = null;
   }
@@ -526,7 +494,6 @@ export class DerbyRoom extends Room<DerbyState> {
       console.error("AddUserVirtualCurrency error:", json);
       return null;
     }
-    // rileggi tutte le valute dopo l’accredito
     return await this._pfGetBalances(pfid);
   }
 }
