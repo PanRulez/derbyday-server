@@ -15,9 +15,9 @@ const VC_SECOND  = "GE";
 /* =========================
    Parametri pista (coerenti col client)
    ========================= */
-// Allinea questi con Godot (Cavallino.gd):
+// Allinea con Godot (Cavallino.gd):
 // - TRACK_X_START = posizione X iniziale dei cavalli
-// - STEP_X        = passo_lunghezza (di default 0.20)
+// - STEP_X        = passo_lunghezza (default 0.20)
 const TRACK_X_START = 0.0;
 const STEP_X = 0.20;
 
@@ -42,7 +42,7 @@ type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;    // alza a 2 se vuoi 2 player minimi
+  minimoGiocatori = 1;     // ↑ a 2 se vuoi 2 player minimi
   puntiVittoria = 21;
 
   countdownStarted = false;
@@ -61,6 +61,13 @@ export class DerbyRoom extends Room<DerbyState> {
   private awardedTokens = new Set<string>();
   private sid2pf = new Map<string, string>();
 
+  // Anti-flood posizioni
+  private lastPosTs = new Map<string, number>();
+  private readonly POS_MIN_INTERVAL_MS = 50; // max ~20 msg/s
+
+  // Soft-authoritative scoring
+  private readonly ALLOWED_STEPS = new Set([1, 2, 4]);
+
   onCreate() {
     this.setState(new DerbyState());
     this.autoDispose = true;
@@ -71,10 +78,27 @@ export class DerbyRoom extends Room<DerbyState> {
     // POSIZIONE (x,y,z) aggiornata dal client umano
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
       if (this.matchTerminato) return;
+
+      // throttle anti-flood
+      const now = Date.now();
+      const last = this.lastPosTs.get(client.sessionId) || 0;
+      if (now - last < this.POS_MIN_INTERVAL_MS) return;
+      this.lastPosTs.set(client.sessionId, now);
+
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      p.x = msg.x; p.y = msg.y; p.z = msg.z;
+      // sanificazione input
+      const safeNum = (v: any, fallback: number) =>
+        Number.isFinite(v) ? Number(v) : fallback;
+
+      // clamp opzionali (se vuoi limitare lo spazio pista)
+      const maxX = TRACK_X_START + STEP_X * this.puntiVittoria + 1.0;
+      const minX = TRACK_X_START - 1.0;
+
+      p.x = Math.max(minX, Math.min(maxX, safeNum(msg.x, p.x)));
+      p.y = safeNum(msg.y, p.y);
+      p.z = safeNum(msg.z, p.z);
 
       // Broadcast delta posizione (i client animano gli avversari)
       this.broadcast(
@@ -86,16 +110,23 @@ export class DerbyRoom extends Room<DerbyState> {
       this._markLeaderboardDirty();
     });
 
-    // PUNTI aggiornati dal client umano
+    // PUNTI aggiornati dal client umano (soft-authoritative: consente solo +1/+2/+4)
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       if (this.matchTerminato) return;
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      const old = p.punti;
-      p.punti = Math.min(Math.max(nuovi_punti | 0, 0), this.puntiVittoria);
+      const safeInt = (v: any) => (Number.isFinite(v) ? (v | 0) : p.punti);
+      const target = Math.min(Math.max(safeInt(nuovi_punti), 0), this.puntiVittoria);
+      const delta = target - p.punti;
 
-      // 🔥 Allinea anche la X lato server per coerenza con i bot
+      // accetta solo incrementi positivi di 1/2/4
+      if (delta <= 0 || !this.ALLOWED_STEPS.has(delta)) return;
+
+      const old = p.punti;
+      p.punti = target;
+
+      // X autoritativa dai punti (coerente con i bot)
       p.x = TRACK_X_START + STEP_X * p.punti;
 
       // Notifiche
@@ -105,7 +136,7 @@ export class DerbyRoom extends Room<DerbyState> {
         punti: p.punti,
       });
 
-      // Invia anche la posizione aggiornata (così i remoti lo vedono avanzare)
+      // anche pos_update per farlo avanzare lato avversari
       this.broadcast("pos_update", {
         sessionId: client.sessionId,
         numero_giocatore: p.numero_giocatore,
@@ -168,7 +199,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
       if (this.tempoRimanente >= 0) {
         this.broadcast("countdown_update", this.tempoRimanente);
-        console.log(`⏳ Countdown: ${this.tempoRimanente}s`);
+        // console.log(`⏳ Countdown: ${this.tempoRimanente}s`);
       }
 
       if (this.tempoRimanente <= 0) this.lanciaMatch();
@@ -260,14 +291,17 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   onLeave(client: Client) {
+    // stop eventuale timer bot con stesso SID
     const botIdx = this.bots.findIndex(b => b.sid === client.sessionId);
     if (botIdx >= 0) {
       const bot = this.bots[botIdx];
       if (bot.timer) clearInterval(bot.timer);
       this.bots.splice(botIdx, 1);
     }
+
     this.state.players.delete(client.sessionId);
     this.sid2pf.delete(client.sessionId);
+    this.lastPosTs.delete(client.sessionId);
 
     this._markLeaderboardDirty();
 
@@ -411,6 +445,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
 
+    // Premi PlayFab (solo umani)
     if (!winnerSid.startsWith("BOT_")) {
       const token = `${winnerSid}:${matchId}`;
       if (!this.awardedTokens.has(token)) {
@@ -441,7 +476,7 @@ export class DerbyRoom extends Room<DerbyState> {
         } else {
           const cli = this.clients.find(c => c.sessionId === winnerSid);
           if (cli) cli.send("coins_awarded", { matchId, delta: 20, reason: "win" });
-          console.warn("⚠️ PlayFab non configurato: nessun accredito server-side.");
+          console.warn("⚠️ PlayFab non configurato: accredito simulato lato server.");
         }
       }
     }
