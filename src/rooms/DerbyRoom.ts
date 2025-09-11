@@ -37,7 +37,12 @@ class DerbyState extends Schema {
   @type({ map: PlayerState }) players = new MapSchema<PlayerState>();
 }
 
-type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
+type BotInfo = {
+  sid: string;
+  numero: number;
+  cycle?: NodeJS.Timeout;            // timer del ciclo principale (ogni 1.2–1.8s)
+  subs?: Set<NodeJS.Timeout>;        // sotto-timer dei micro-step (250–370ms)
+};
 
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
@@ -199,7 +204,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
       if (this.tempoRimanente >= 0) {
         this.broadcast("countdown_update", this.tempoRimanente);
-        // console.log(`⏳ Countdown: ${this.tempoRimanente}s`);
       }
 
       if (this.tempoRimanente <= 0) this.lanciaMatch();
@@ -291,11 +295,10 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   onLeave(client: Client) {
-    // stop eventuale timer bot con stesso SID
+    // se per caso il SID combaciasse con un bot (non dovrebbe), pulisci
     const botIdx = this.bots.findIndex(b => b.sid === client.sessionId);
     if (botIdx >= 0) {
-      const bot = this.bots[botIdx];
-      if (bot.timer) clearInterval(bot.timer);
+      this._clearBotTimers(this.bots[botIdx]);
       this.bots.splice(botIdx, 1);
     }
 
@@ -336,7 +339,7 @@ export class DerbyRoom extends Room<DerbyState> {
         ps.x = TRACK_X_START; ps.y = 0; ps.z = 0;
 
         this.state.players.set(sid, ps);
-        this.bots.push({ sid, numero: i });
+        this.bots.push({ sid, numero: i, subs: new Set() });
         this.broadcast("giocatore_mappato", { sessionId: sid, numero_giocatore: i });
         console.log(`🤖 BOT creato: ${sid} → Player ${i}`);
       }
@@ -345,46 +348,71 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   private _runBots() {
-    const WEIGHTS = [{ s: 1, w: 85 }, { s: 2, w: 14 }, { s: 4, w: 1 }];
+    // Più frequente (1.2–1.8s) + micro-step per step > 1
+    const WEIGHTS = [{ s: 1, w: 90 }, { s: 2, w: 9 }, { s: 4, w: 1 }];
     const totalW = WEIGHTS.reduce((a, b) => a + b.w, 0);
 
     for (const bot of this.bots) {
-      const baseMs = 9000 + Math.floor(Math.random() * 3000);
-      const jitter = 0.4;
-      const minMs = Math.floor(baseMs * (1 - jitter));
-      const maxMs = Math.floor(baseMs * (1 + jitter));
+      const baseMs = 1200 + Math.floor(Math.random() * 600); // 1.2–1.8s
 
-      const tick = () => {
+      const doOneCycle = () => {
         if (this.matchTerminato) return;
         const ps = this.state.players.get(bot.sid);
         if (!ps) return;
 
+        // estrai 1/2/4 con pesi
         let r = Math.floor(Math.random() * totalW);
         let pick = 1;
         for (const k of WEIGHTS) { if (r < k.w) { pick = k.s; break; } r -= k.w; }
 
-        const prev = ps.punti;
-        ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
+        // esegui in micro-step da +1 ogni 250–370ms
+        let remaining = Math.min(pick, Math.max(0, this.puntiVittoria - ps.punti));
+        if (remaining <= 0) return;
 
-        // Autoritative X basata sui punti
-        ps.x = TRACK_X_START + STEP_X * ps.punti;
+        const subTick = () => {
+          if (this.matchTerminato) return;
+          const ps2 = this.state.players.get(bot.sid);
+          if (!ps2) return;
 
-        // Notifiche score + posizione
-        this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
-        this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
+          const prev = ps2.punti;
+          if (prev >= this.puntiVittoria) return;
 
-        this._markLeaderboardDirty();
+          ps2.punti = Math.min(prev + 1, this.puntiVittoria);
+          // Autoritative X basata sui punti
+          ps2.x = TRACK_X_START + STEP_X * ps2.punti;
 
-        if (!this.matchTerminato && ps.punti >= this.puntiVittoria && prev < this.puntiVittoria) {
-          this._fineGara(bot.sid, bot.numero, null);
-        }
+          // Notifiche score + posizione
+          this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps2.punti });
+          this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps2.x, y: ps2.y, z: ps2.z });
+
+          this._markLeaderboardDirty();
+
+          if (!this.matchTerminato && ps2.punti >= this.puntiVittoria && prev < this.puntiVittoria) {
+            this._fineGara(bot.sid, bot.numero, null);
+            return;
+          }
+
+          remaining -= 1;
+          if (remaining > 0 && !this.matchTerminato) {
+            const t = setTimeout(subTick, 250 + Math.floor(Math.random() * 120)); // 250–370ms
+            bot.subs?.add(t);
+          }
+        };
+
+        const first = setTimeout(() => {
+          subTick();
+          bot.subs?.delete(first);
+        }, 0);
+        bot.subs?.add(first);
       };
 
-      const firstDelay = minMs + Math.floor(Math.random() * (maxMs - minMs));
-      setTimeout(() => {
-        tick();
-        bot.timer = setInterval(() => tick(), minMs + Math.floor(Math.random() * (maxMs - minMs)));
-      }, firstDelay);
+      // ciclo principale
+      bot.cycle = setInterval(() => {
+        doOneCycle();
+      }, baseMs);
+
+      // piccolo jitter iniziale per desincronizzare
+      setTimeout(doOneCycle, Math.floor(Math.random() * baseMs));
     }
   }
 
@@ -485,10 +513,18 @@ export class DerbyRoom extends Room<DerbyState> {
     setTimeout(() => this.disconnect(), 1500);
   }
 
+  private _clearBotTimers(b: BotInfo) {
+    if (b.cycle) clearInterval(b.cycle);
+    if (b.subs && b.subs.size) {
+      for (const t of b.subs) clearTimeout(t);
+      b.subs.clear();
+    }
+  }
+
   private _clearAllTimers() {
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
-    for (const b of this.bots) if (b.timer) clearInterval(b.timer);
+    for (const b of this.bots) this._clearBotTimers(b);
     this.bots = [];
 
     if (this.leaderboardTimer) { clearInterval(this.leaderboardTimer); this.leaderboardTimer = null; }
