@@ -24,15 +24,15 @@ const STEP_X = 0.20;
 /* =========================
    Tuning bot
    ========================= */
-const BOT_BASE_MS_MIN = 9000;  // ← vecchia velocità
-const BOT_BASE_MS_MAX = 12000; // ← vecchia velocità
+const BOT_BASE_MS_MIN = 9000;   // ← vecchia velocità
+const BOT_BASE_MS_MAX = 12000;  // ← vecchia velocità
 const BOT_WEIGHTS = [
   { s: 1, w: 85 },
   { s: 2, w: 14 },
   { s: 4, w: 1 },
 ];
-// Per evitare “lotta” con i tween client dei bot, di default NON spediamo pos_update
-const BOT_POS_UPDATES = false; // metti true se vuoi anche i pos_update dei bot
+const BOT_POS_UPDATES = false;      // no pos_update dai bot (evita conflitti con tween client)
+const BOT_START_DELAY_MS = 5000;    // ⏱️ ritardo partenza bot: 5s
 
 /* =========================
    State
@@ -74,7 +74,7 @@ export class DerbyRoom extends Room<DerbyState> {
   private awardedTokens = new Set<string>();
   private sid2pf = new Map<string, string>();
 
-  // Anti-flood posizioni
+  // Anti-flood posizioni umane
   private lastPosTs = new Map<string, number>();
   private readonly POS_MIN_INTERVAL_MS = 50; // max ~20 msg/s
 
@@ -101,7 +101,6 @@ export class DerbyRoom extends Room<DerbyState> {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      // sanificazione
       const safeNum = (v: any, fallback: number) =>
         Number.isFinite(v) ? Number(v) : fallback;
 
@@ -113,7 +112,7 @@ export class DerbyRoom extends Room<DerbyState> {
       p.y = safeNum(msg.y, p.y);
       p.z = safeNum(msg.z, p.z);
 
-      // Broadcast delta posizione (gli altri client possono usarlo per correzioni rare)
+      // Broadcast posizione (usata dai client come correzione eventuale)
       this.broadcast(
         "pos_update",
         { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z },
@@ -178,7 +177,6 @@ export class DerbyRoom extends Room<DerbyState> {
         snap.push({ sessionId: sid, numero_giocatore: ps.numero_giocatore })
       );
       client.send("mappa_iniziale", snap);
-      console.log("📦 Snapshot inviata a", client.sessionId, snap);
     });
 
     // Start manuale countdown
@@ -242,7 +240,10 @@ export class DerbyRoom extends Room<DerbyState> {
     // classifica periodica
     this._startLeaderboardTicker(300);
 
-    setTimeout(() => this._runBots(), 800);
+    // ▶️ avvio bot dopo 5s, poi mantengono la vecchia cadenza 9–12s
+    setTimeout(() => {
+      if (!this.matchTerminato) this._runBots(true);
+    }, BOT_START_DELAY_MS);
   }
 
   /* =========================
@@ -346,7 +347,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this._markLeaderboardDirty();
   }
 
-  private _runBots() {
+  private _runBots(startImmediate = false) {
     const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
 
     for (const bot of this.bots) {
@@ -371,7 +372,7 @@ export class DerbyRoom extends Room<DerbyState> {
         // Notifiche score (il client chiama avanza(diff) → animazione fluida)
         this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
 
-        // Facoltativo: pos_update dei bot (DISABILITATO di default per non lottare con i tween client)
+        // Facoltativo: pos_update dei bot (DISABILITATO per non lottare con i tween client)
         if (BOT_POS_UPDATES) {
           this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
         }
@@ -383,11 +384,17 @@ export class DerbyRoom extends Room<DerbyState> {
         }
       };
 
-      // primo tick dopo jitter random
-      setTimeout(() => {
+      if (startImmediate) {
+        // primo tick subito (dopo i 5s), poi ogni baseMs
         tick();
         bot.timer = setInterval(tick, baseMs);
-      }, Math.floor(Math.random() * baseMs));
+      } else {
+        // fallback: jitter iniziale
+        setTimeout(() => {
+          tick();
+          bot.timer = setInterval(tick, baseMs);
+        }, Math.floor(Math.random() * baseMs));
+      }
     }
   }
 
