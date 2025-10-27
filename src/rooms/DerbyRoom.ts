@@ -166,6 +166,14 @@ export class DerbyRoom extends Room<DerbyState> {
     this.onMessage("start_matchmaking", () => {
       this._tryStartCountdown("MSG");
     });
+
+    // 🔥 Nuovo: spesa monete server-authoritative
+    this.onMessage("wallet_spend", (client, msg: { orderId?: string; amount?: number; reason?: string }) => {
+      this._handleWalletSpend(client, msg).catch(err => {
+        console.warn("wallet_spend error:", err?.message || err);
+        client.send("wallet_spend_result", { ok: false, error: "server_error" });
+      });
+    });
   }
 
   /* =========================
@@ -440,15 +448,19 @@ export class DerbyRoom extends Room<DerbyState> {
           this._pfAddCurrency(pfid, VC_PRIMARY, delta)
             .then(newTotals => {
               const cli = this.clients.find(c => c.sessionId === winnerSid);
-              if (cli) {
-                cli.send("coins_awarded", { matchId, delta, reason: "win" });
-                if (newTotals) {
-                  cli.send("wallet_sync", {
-                    totalCO: newTotals[VC_PRIMARY] ?? 0,
-                    totalGE: newTotals[VC_SECOND] ?? 0,
-                  });
-                }
+              if (!cli) return;
+
+              // 1) manda i totali aggiornati (server-authoritative)
+              if (newTotals) {
+                cli.send("wallet_sync", {
+                  totalCO: newTotals[VC_PRIMARY] ?? 0,
+                  totalGE: newTotals[VC_SECOND] ?? 0,
+                  matchId, reason: "win", delta
+                });
               }
+
+              // 2) poi il toast
+              cli.send("coins_awarded", { matchId, delta, reason: "win" });
             })
             .catch(err => {
               console.warn("PF award failed:", err?.message || err);
@@ -464,6 +476,73 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this._clearAllTimers();
     setTimeout(() => this.disconnect(), 1500);
+  }
+
+  /* =========================
+     Spesa monete (server-authoritative)
+     ========================= */
+  private async _handleWalletSpend(client: Client, msg: { orderId?: string; amount?: number; reason?: string }) {
+    const orderId = (msg?.orderId ?? "").toString().slice(0, 64);
+    const amount  = Math.abs(Number(msg?.amount ?? 0)) | 0;
+    const reason  = (msg?.reason ?? "spend").toString().slice(0, 32);
+
+    if (!orderId || amount <= 0) {
+      client.send("wallet_spend_result", { ok: false, error: "bad_request" });
+      return;
+    }
+    const pfid = this.sid2pf.get(client.sessionId);
+    if (!pfid || !PF_HOST || !PF_SECRET) {
+      client.send("wallet_spend_result", { ok: false, error: "no_playfab" });
+      return;
+    }
+
+    const idemKey = `spent_order_${orderId}`;
+    try {
+      // idempotenza: se già speso, restituisci stato attuale
+      const ud = await this._pfGetUserData(pfid, [idemKey]);
+      if (ud && ud[idemKey]) {
+        const vc = await this._pfGetBalances(pfid);
+        if (vc) {
+          client.send("wallet_sync", {
+            totalCO: vc[VC_PRIMARY] ?? 0,
+            totalGE: vc[VC_SECOND] ?? 0,
+            reason: "spend_dup",
+            delta: 0,
+            orderId
+          });
+        }
+        client.send("wallet_spend_result", { ok: true, orderId });
+        return;
+      }
+
+      // fondi sufficienti?
+      const vc = await this._pfGetBalances(pfid);
+      const current = vc?.[VC_PRIMARY] ?? 0;
+      if (!vc || current < amount) {
+        client.send("wallet_spend_result", { ok: false, error: "insufficient_funds", balance: current, orderId });
+        return;
+      }
+
+      // sottrai e marca idempotenza
+      await this._pfSubtractCurrency(pfid, VC_PRIMARY, amount);
+      await this._pfUpdateUserData(pfid, { [idemKey]: "true" });
+
+      // invia i totali aggiornati + esito
+      const newTotals = await this._pfGetBalances(pfid);
+      if (newTotals) {
+        client.send("wallet_sync", {
+          totalCO: newTotals[VC_PRIMARY] ?? 0,
+          totalGE: newTotals[VC_SECOND] ?? 0,
+          reason: reason,
+          delta: -amount,
+          orderId
+        });
+      }
+      client.send("wallet_spend_result", { ok: true, orderId });
+    } catch (e) {
+      console.warn("wallet_spend exception:", (e as any)?.message || e);
+      client.send("wallet_spend_result", { ok: false, error: "server_error" });
+    }
   }
 
   private _clearAllTimers() {
@@ -499,11 +578,4 @@ export class DerbyRoom extends Room<DerbyState> {
     if (!PF_HOST || !PF_SECRET) return null;
     const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
-    });
-    const json = await res.json();
-    if (json.code !== 200) return null;
-    return await this._pfGetBalances(pfid);
-  }
-}
+      headers: { "Content-Type": "application/json", "X-SecretKey
