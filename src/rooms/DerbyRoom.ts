@@ -8,7 +8,7 @@ const PF_TITLE_ID = process.env.PLAYFAB_TITLE_ID || "";
 const PF_SECRET   = process.env.PLAYFAB_SECRET_KEY || "";
 const PF_HOST     = PF_TITLE_ID ? `https://${PF_TITLE_ID}.playfabapi.com` : "";
 
-// Se usi Node < 18, installa "node-fetch" e abilita la riga seguente:
+// Se usi Node < 18, installa "node-fetch" e decommenta:
 // // eslint-disable-next-line @typescript-eslint/no-var-requires
 // const fetch: typeof globalThis.fetch = (global as any).fetch ?? require("node-fetch");
 
@@ -55,7 +55,7 @@ type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;
+  minimoGiocatori = 1;       // se vuoi il via solo con 2+, metti 2
   puntiVittoria = 21;
 
   countdownStarted = false;
@@ -167,7 +167,7 @@ export class DerbyRoom extends Room<DerbyState> {
       this._tryStartCountdown("MSG");
     });
 
-    // 🔥 Nuovo: spesa monete server-authoritative
+    // 🔥 Spesa monete server-authoritative (idempotente)
     this.onMessage("wallet_spend", (client, msg: { orderId?: string; amount?: number; reason?: string }) => {
       this._handleWalletSpend(client, msg).catch(err => {
         console.warn("wallet_spend error:", err?.message || err);
@@ -450,7 +450,7 @@ export class DerbyRoom extends Room<DerbyState> {
               const cli = this.clients.find(c => c.sessionId === winnerSid);
               if (!cli) return;
 
-              // 1) manda i totali aggiornati (server-authoritative)
+              // 1) invia totali aggiornati (server-authoritative)
               if (newTotals) {
                 cli.send("wallet_sync", {
                   totalCO: newTotals[VC_PRIMARY] ?? 0,
@@ -561,6 +561,7 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      PlayFab helpers
      ========================= */
+
   private async _pfGetBalances(pfid: string): Promise<Record<string, number> | null> {
     if (!PF_HOST || !PF_SECRET) return null;
     const res = await fetch(`${PF_HOST}/Server/GetUserInventory`, {
@@ -578,4 +579,51 @@ export class DerbyRoom extends Room<DerbyState> {
     if (!PF_HOST || !PF_SECRET) return null;
     const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-SecretKey
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`AddUserVirtualCurrency failed: ${json.status ?? json.error ?? "unknown"}`);
+    // Per sicurezza, rileggo i totali aggiornati
+    return this._pfGetBalances(pfid);
+  }
+
+  private async _pfSubtractCurrency(pfid: string, code: string, amount: number): Promise<Record<string, number> | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/SubtractUserVirtualCurrency`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`SubtractUserVirtualCurrency failed: ${json.status ?? json.error ?? "unknown"}`);
+    return this._pfGetBalances(pfid);
+  }
+
+  private async _pfGetUserData(pfid: string, keys?: string[]): Promise<Record<string, string> | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/GetUserData`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, Keys: keys }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) return null;
+    const data = json.data?.Data || {};
+    const out: Record<string, string> = {};
+    Object.keys(data).forEach(k => out[k] = data[k]?.Value ?? "");
+    return out;
+  }
+
+  private async _pfUpdateUserData(pfid: string, data: Record<string, string>): Promise<void> {
+    if (!PF_HOST || !PF_SECRET) return;
+    const res = await fetch(`${PF_HOST}/Server/UpdateUserData`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, Data: data }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`UpdateUserData failed: ${json.status ?? json.error ?? "unknown"}`);
+  }
+}
+
