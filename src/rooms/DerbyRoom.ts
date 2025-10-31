@@ -144,7 +144,7 @@ export class DerbyRoom extends Room<DerbyState> {
       this._markLeaderboardDirty();
 
       if (!this.matchTerminato && p.punti >= this.puntiVittoria && old < this.puntiVittoria) {
-        this._fineGara(client.sessionId, p.numero_giocatore, null);
+        void this._fineGara(client.sessionId, p.numero_giocatore, null);
       }
     });
 
@@ -364,7 +364,7 @@ export class DerbyRoom extends Room<DerbyState> {
         this._markLeaderboardDirty();
 
         if (!this.matchTerminato && ps.punti >= this.puntiVittoria && prev < this.puntiVittoria) {
-          this._fineGara(bot.sid, bot.numero, null);
+          void this._fineGara(bot.sid, bot.numero, null);
         }
       };
 
@@ -422,9 +422,9 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Fine gara + premi PlayFab
+     Fine gara + premi PlayFab (with await)
      ========================= */
-  private _fineGara(winnerSid: string, numero: number, tempo: number | null) {
+  private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
     if (this.matchTerminato) return;
     this.matchTerminato = true;
 
@@ -434,6 +434,9 @@ export class DerbyRoom extends Room<DerbyState> {
     this.broadcast("classifica_update", finalBoard);
 
     this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo });
+
+    // Prepara promise accredito (se necessario)
+    let awardPromise: Promise<void> = Promise.resolve();
 
     if (!winnerSid.startsWith("BOT_")) {
       const token = `${winnerSid}:${matchId}`;
@@ -445,7 +448,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
         if (pfid && PF_HOST && PF_SECRET) {
           const delta = 20;
-          this._pfAddCurrency(pfid, VC_PRIMARY, delta)
+          awardPromise = this._pfAddCurrency(pfid, VC_PRIMARY, delta)
             .then(newTotals => {
               const cli = this.clients.find(c => c.sessionId === winnerSid);
               if (!cli) return;
@@ -474,8 +477,18 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     }
 
+    // Ferma timer/bot
     this._clearAllTimers();
-    setTimeout(() => this.disconnect(), 1500);
+
+    // Attendi che parta l'invio del premio (o max 3s), poi chiudi
+    try {
+      await Promise.race([
+        awardPromise,
+        new Promise<void>(res => setTimeout(res, 3000))
+      ]);
+    } catch { /* ignore */ }
+
+    setTimeout(() => this.disconnect(), 500);
   }
 
   /* =========================
@@ -626,4 +639,3 @@ export class DerbyRoom extends Room<DerbyState> {
     if (json.code !== 200) throw new Error(`UpdateUserData failed: ${json.status ?? json.error ?? "unknown"}`);
   }
 }
-
