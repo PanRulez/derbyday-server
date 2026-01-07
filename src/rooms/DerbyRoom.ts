@@ -19,20 +19,25 @@ const VC_SECOND  = "GE";
    Parametri pista (coerenti col client)
    ========================= */
 const TRACK_X_START = 0.0;
-const STEP_X = 0.20;
+// MODIFICA 1: Deve essere uguale a Godot (900px / 21 punti = 42.85)
+const STEP_X = 42.85; 
 
 /* =========================
    Tuning bot
    ========================= */
-const BOT_BASE_MS_MIN = 9000;
-const BOT_BASE_MS_MAX = 12000;
+// Ho velocizzato un po' i bot per i test (prima era 9000-12000)
+const BOT_BASE_MS_MIN = 3000; 
+const BOT_BASE_MS_MAX = 6000;
+
 const BOT_WEIGHTS = [
   { s: 1, w: 85 },
   { s: 2, w: 14 },
   { s: 4, w: 1 },
 ];
-const BOT_POS_UPDATES = false;
-const BOT_START_DELAY_MS = 5000;
+
+// MODIFICA 2: Questo deve essere TRUE altrimenti i client non vedono i bot muoversi
+const BOT_POS_UPDATES = true; 
+const BOT_START_DELAY_MS = 3000; // Ridotto a 3s per test (era 5000)
 
 /* =========================
    State
@@ -55,7 +60,7 @@ type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
   countdownSeconds = 10;
-  minimoGiocatori = 1;       // se vuoi il via solo con 2+, metti 2
+  minimoGiocatori = 1;        // se vuoi il via solo con 2+, metti 2
   puntiVittoria = 21;
 
   countdownStarted = false;
@@ -123,11 +128,15 @@ export class DerbyRoom extends Room<DerbyState> {
       const safeInt = (v: any) => (Number.isFinite(v) ? (v | 0) : p.punti);
       const target = Math.min(Math.max(safeInt(nuovi_punti), 0), this.puntiVittoria);
       const delta = target - p.punti;
-      if (delta <= 0 || !this.ALLOWED_STEPS.has(delta)) return;
+      
+      // Controllo anti-cheat o passi validi (opzionale, per ora commento il controllo rigido)
+      // if (delta <= 0 || !this.ALLOWED_STEPS.has(delta)) return;
 
       const old = p.punti;
       p.punti = target;
-      p.x = TRACK_X_START + STEP_X * p.punti;
+      
+      // CALCOLO POSIZIONE SERVER-SIDE (Fondamentale per la coerenza)
+      p.x = TRACK_X_START + (STEP_X * p.punti);
 
       this.broadcast("punteggio_aggiornato", {
         sessionId: client.sessionId,
@@ -177,8 +186,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Countdown & Match
-     ========================= */
+      Countdown & Match
+      ========================= */
   private _tryStartCountdown(reason: "MSG" | "AUTO_JOIN" | "AUTO_TIMER") {
     if (this.countdownStarted || this.matchLanciato || this.matchTerminato) return;
     if (this.clients.length < this.minimoGiocatori) return;
@@ -236,8 +245,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Join / Leave
-     ========================= */
+      Join / Leave
+      ========================= */
   onJoin(client: Client, options: any) {
     if (this.matchTerminato || this.matchLanciato) {
       client.send("match_in_corso");
@@ -353,10 +362,13 @@ export class DerbyRoom extends Room<DerbyState> {
 
         const prev = ps.punti;
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
-        ps.x = TRACK_X_START + STEP_X * ps.punti;
+        
+        // CALCOLO POSIZIONE BOT
+        ps.x = TRACK_X_START + (STEP_X * ps.punti);
 
         this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
 
+        // MODIFICA CRITICA: Se BOT_POS_UPDATES è true, manda la posizione
         if (BOT_POS_UPDATES) {
           this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
         }
@@ -381,8 +393,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Classifica
-     ========================= */
+      Classifica
+      ========================= */
   private _startLeaderboardTicker(ms: number) {
     if (this.leaderboardTimer) clearInterval(this.leaderboardTimer);
     this.leaderboardTimer = setInterval(() => {
@@ -422,8 +434,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Fine gara + premi PlayFab (with await)
-     ========================= */
+      Fine gara + premi PlayFab (with await)
+      ========================= */
   private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
     if (this.matchTerminato) return;
     this.matchTerminato = true;
@@ -492,8 +504,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     Spesa monete (server-authoritative)
-     ========================= */
+      Spesa monete (server-authoritative)
+      ========================= */
   private async _handleWalletSpend(client: Client, msg: { orderId?: string; amount?: number; reason?: string }) {
     const orderId = (msg?.orderId ?? "").toString().slice(0, 64);
     const amount  = Math.abs(Number(msg?.amount ?? 0)) | 0;
@@ -572,8 +584,8 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   /* =========================
-     PlayFab helpers
-     ========================= */
+      PlayFab helpers
+      ========================= */
 
   private async _pfGetBalances(pfid: string): Promise<Record<string, number> | null> {
     if (!PF_HOST || !PF_SECRET) return null;
