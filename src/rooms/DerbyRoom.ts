@@ -625,4 +625,66 @@ export class DerbyRoom extends Room<DerbyState> {
       ========================= */
 
   private async _pfGetBalances(pfid: string): Promise<Record<string, number> | null> {
-    if (!PF_HOST ||
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/GetUserInventory`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) return null;
+    const vc = json.data?.VirtualCurrency || {};
+    return vc as Record<string, number>;
+  }
+
+  private async _pfAddCurrency(pfid: string, code: string, amount: number): Promise<Record<string, number> | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`AddUserVirtualCurrency failed: ${json.status ?? json.error ?? "unknown"}`);
+    // Per sicurezza, rileggo i totali aggiornati
+    return this._pfGetBalances(pfid);
+  }
+
+  private async _pfSubtractCurrency(pfid: string, code: string, amount: number): Promise<Record<string, number> | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/SubtractUserVirtualCurrency`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`SubtractUserVirtualCurrency failed: ${json.status ?? json.error ?? "unknown"}`);
+    return this._pfGetBalances(pfid);
+  }
+
+  private async _pfGetUserData(pfid: string, keys?: string[]): Promise<Record<string, string> | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+    const res = await fetch(`${PF_HOST}/Server/GetUserData`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, Keys: keys }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) return null;
+    const data = json.data?.Data || {};
+    const out: Record<string, string> = {};
+    Object.keys(data).forEach(k => out[k] = data[k]?.Value ?? "");
+    return out;
+  }
+
+  private async _pfUpdateUserData(pfid: string, data: Record<string, string>): Promise<void> {
+    if (!PF_HOST || !PF_SECRET) return;
+    const res = await fetch(`${PF_HOST}/Server/UpdateUserData`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+      body: JSON.stringify({ PlayFabId: pfid, Data: data }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) throw new Error(`UpdateUserData failed: ${json.status ?? json.error ?? "unknown"}`);
+  }
+}
