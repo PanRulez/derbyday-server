@@ -81,7 +81,7 @@ export class DerbyRoom extends Room<DerbyState> {
   leaderboardDirty = false;
 
   matchId: string | null = null;
-  private awardedTokens = new Set<string>();
+
   private sid2pf = new Map<string, string>();
   private lastPosTs = new Map<string, number>();
   private readonly POS_MIN_INTERVAL_MS = 50;
@@ -150,8 +150,17 @@ export class DerbyRoom extends Room<DerbyState> {
         p.punti = target;
         p.x = TRACK_X_START + (STEP_X * p.punti);
 
-        this.broadcast("punteggio_aggiornato", { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, punti: p.punti });
-        this.broadcast("pos_update", { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z });
+        this.broadcast("punteggio_aggiornato", {
+          sessionId: client.sessionId,
+          numero_giocatore: p.numero_giocatore,
+          punti: p.punti
+        });
+
+        this.broadcast("pos_update", {
+          sessionId: client.sessionId,
+          numero_giocatore: p.numero_giocatore,
+          x: p.x, y: p.y, z: p.z
+        });
 
         this._markLeaderboardDirty();
 
@@ -182,16 +191,13 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     /**
-     * ✅ FIX CRASH: handler per il messaggio "lancio"
-     * Il client lo invia quando rilascia la pallina.
-     * Qui lo validiamo e (se vuoi) lo broadcastiamo agli altri.
+     * ✅ FIX: handler "lancio" (il client lo invia al rilascio pallina)
+     * Non aggiorna punti: serve solo per VFX o sync eventuale.
      */
     this.onMessage("lancio", (client, msg: any) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
         if (this.matchTerminato) return;
-
-        // Accetta anche se match non lanciato? Io direi NO:
         if (!this.matchLanciato) return;
 
         const p = this.state.players.get(client.sessionId);
@@ -199,14 +205,13 @@ export class DerbyRoom extends Room<DerbyState> {
 
         const fx = safeNum(msg?.fx, 0);
         const fz = safeNum(msg?.fz, 0);
-        const x  = safeNum(msg?.x,  p.x);
-        const z  = safeNum(msg?.z,  p.z);
+        const x  = safeNum(msg?.x, p.x);
+        const z  = safeNum(msg?.z, p.z);
 
-        // (opzionale) clamp per evitare valori assurdi
+        // clamp per evitare valori assurdi
         const fxC = clamp(fx, -200, 200);
         const fzC = clamp(fz, -200, 200);
 
-        // Se vuoi: inoltra agli altri per effetti/animazioni
         this.broadcast(
           "lancio_update",
           { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, fx: fxC, fz: fzC, x, z },
@@ -220,7 +225,6 @@ export class DerbyRoom extends Room<DerbyState> {
     this.onMessage("wallet_spend", (client, msg) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
-        // se non hai ancora implementato, NON far crashare:
         const maybePromise = this._handleWalletSpend(client, msg);
         if (maybePromise && typeof (maybePromise as any).catch === "function") {
           (maybePromise as any).catch((err: any) => console.error("[wallet_spend] error:", err));
@@ -231,7 +235,7 @@ export class DerbyRoom extends Room<DerbyState> {
     });
   }
 
-  private _tryStartCountdown(reason: string) {
+  private _tryStartCountdown(_reason: string) {
     if (this.countdownStarted || this.matchLanciato || this.matchTerminato) return;
     if (this.clients.length < this.minimoGiocatori) return;
 
@@ -249,11 +253,11 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   private lanciaMatch() {
-    if (this.matchLanciato) return;
+    if (this.matchLanciato || this.matchTerminato) return;
 
     this.matchLanciato = true;
     this.countdownStarted = false;
-    if (this.interval) clearInterval(this.interval);
+    if (this.interval) { clearInterval(this.interval); this.interval = null; }
 
     this.lock();
     this._spawnBotsIfNeeded();
@@ -271,6 +275,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
   onJoin(client: Client, options: any) {
     this.lastActivity.set(client.sessionId, Date.now());
+
     if (this.matchTerminato || this.matchLanciato) {
       client.send("match_in_corso");
       client.leave();
@@ -286,9 +291,14 @@ export class DerbyRoom extends Room<DerbyState> {
     const pfid = String(options?.playfabId || "");
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
-      this._pfGetBalances(pfid).then(vc => {
-        if (vc) client.send("wallet_sync", { totalCO: vc[VC_PRIMARY] ?? 0, totalGE: vc[VC_SECOND] ?? 0 });
-      }).catch(err => console.error("[_pfGetBalances] error:", err));
+      this._pfGetBalances(pfid)
+        .then(vc => {
+          if (vc) client.send("wallet_sync", {
+            totalCO: vc[VC_PRIMARY] ?? 0,
+            totalGE: vc[VC_SECOND] ?? 0
+          });
+        })
+        .catch(err => console.error("[_pfGetBalances] error:", err));
     }
 
     client.send("numero_giocatore", numero);
@@ -299,16 +309,53 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
+  onLeave(client: Client) {
+    try {
+      this.lastActivity.delete(client.sessionId);
+      this.lastPosTs.delete(client.sessionId);
+      this.sid2pf.delete(client.sessionId);
+
+      // rimuovi player dallo stato (importante, altrimenti rimane "fantasma")
+      if (this.state.players.has(client.sessionId)) {
+        this.state.players.delete(client.sessionId);
+        this._markLeaderboardDirty();
+      }
+
+      // se restano 0 client umani e match non terminato, chiudi
+      const humansLeft = this.clients.length;
+      if (humansLeft <= 0 && !this.matchTerminato) {
+        this.matchTerminato = true;
+        this._clearAllTimers();
+        this.disconnect();
+      }
+    } catch (e) {
+      console.error("[onLeave] error:", e);
+    }
+  }
+
+  onDispose() {
+    // sempre cleanup
+    this._clearAllTimers();
+  }
+
   private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
     if (this.matchTerminato) return;
+
     this.matchTerminato = true;
     this._clearAllTimers();
 
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
     const finalBoard = this._buildLeaderboardPayload();
 
-    this.broadcast("gara_finita", { matchId, winner: winnerSid, numero_giocatore: numero, tempo, classifica: finalBoard });
+    this.broadcast("gara_finita", {
+      matchId,
+      winner: winnerSid,
+      numero_giocatore: numero,
+      tempo,
+      classifica: finalBoard
+    });
 
+    // accredito PlayFab solo se winner è umano
     if (!winnerSid.startsWith("BOT_")) {
       const pfid = this.sid2pf.get(winnerSid);
       if (pfid && PF_HOST && PF_SECRET) {
@@ -316,70 +363,102 @@ export class DerbyRoom extends Room<DerbyState> {
           const newTotals = await this._pfAddCurrency(pfid, VC_PRIMARY, 20);
           const cli = this.clients.find(c => c.sessionId === winnerSid);
           if (cli && newTotals) {
-            cli.send("wallet_sync", { totalCO: newTotals[VC_PRIMARY] ?? 0, totalGE: newTotals[VC_SECOND] ?? 0, reason: "win" });
+            cli.send("wallet_sync", {
+              totalCO: newTotals[VC_PRIMARY] ?? 0,
+              totalGE: newTotals[VC_SECOND] ?? 0,
+              reason: "win"
+            });
             cli.send("coins_awarded", { matchId, delta: 20 });
           }
         } catch (e) {
-          console.error("PF Error:", e);
+          console.error("[PF] Error:", e);
         }
       }
     }
 
+    // chiudi stanza dopo 10s (podio)
     setTimeout(() => {
       this.disconnect();
     }, 10000);
   }
 
-  private _runBots(startImmediate = false) {
+  private _runBots(_startImmediate = false) {
     const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
+
     for (const bot of this.bots) {
       const baseMs = BOT_BASE_MS_MIN + Math.floor(Math.random() * (BOT_BASE_MS_MAX - BOT_BASE_MS_MIN));
+
       const tick = () => {
         if (this.matchTerminato) return;
+
         const ps = this.state.players.get(bot.sid);
         if (!ps) return;
 
         let r = Math.floor(Math.random() * totalW);
         let pick = 1;
-        for (const k of BOT_WEIGHTS) { if (r < k.w) { pick = k.s; break; } r -= k.w; }
+        for (const k of BOT_WEIGHTS) {
+          if (r < k.w) { pick = k.s; break; }
+          r -= k.w;
+        }
 
         const old = ps.punti;
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
         ps.x = TRACK_X_START + (STEP_X * ps.punti);
 
-        this.broadcast("punteggio_aggiornato", { sessionId: bot.sid, numero_giocatore: bot.numero, punti: ps.punti });
-        if (BOT_POS_UPDATES) this.broadcast("pos_update", { sessionId: bot.sid, numero_giocatore: bot.numero, x: ps.x, y: ps.y, z: ps.z });
+        this.broadcast("punteggio_aggiornato", {
+          sessionId: bot.sid,
+          numero_giocatore: bot.numero,
+          punti: ps.punti
+        });
+
+        if (BOT_POS_UPDATES) {
+          this.broadcast("pos_update", {
+            sessionId: bot.sid,
+            numero_giocatore: bot.numero,
+            x: ps.x, y: ps.y, z: ps.z
+          });
+        }
 
         this._markLeaderboardDirty();
-        if (ps.punti >= this.puntiVittoria && old < this.puntiVittoria) this._fineGara(bot.sid, bot.numero, null);
+
+        if (ps.punti >= this.puntiVittoria && old < this.puntiVittoria) {
+          this._fineGara(bot.sid, bot.numero, null);
+        }
       };
+
       bot.timer = setInterval(tick, baseMs);
     }
   }
 
   private _clearAllTimers() {
-    if (this.interval) clearInterval(this.interval);
-    if (this.autostartTimeout) clearTimeout(this.autostartTimeout);
-    if (this.leaderboardTimer) clearInterval(this.leaderboardTimer);
-    this.bots.forEach(b => { if (b.timer) clearInterval(b.timer); });
+    if (this.interval) { clearInterval(this.interval); this.interval = null; }
+    if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
+    if (this.leaderboardTimer) { clearInterval(this.leaderboardTimer); this.leaderboardTimer = null; }
+    this.bots.forEach(b => { if (b.timer) clearInterval(b.timer); b.timer = undefined; });
   }
 
   private async _pfAddCurrency(pfid: string, code: string, amount: number) {
+    if (!PF_HOST || !PF_SECRET) return null;
+
     const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
       body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
     });
+
     const json = await res.json().catch(() => null);
     return json?.code === 200 ? this._pfGetBalances(pfid) : null;
   }
 
   private async _pfGetBalances(pfid: string) {
+    if (!PF_HOST || !PF_SECRET) return null;
+
     const res = await fetch(`${PF_HOST}/Server/GetUserInventory`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
       body: JSON.stringify({ PlayFabId: pfid }),
     });
+
     const json = await res.json().catch(() => null);
     return json?.code === 200 ? json.data.VirtualCurrency : null;
   }
@@ -394,6 +473,7 @@ export class DerbyRoom extends Room<DerbyState> {
   private _spawnBotsIfNeeded() {
     const used = new Set<number>();
     this.state.players.forEach(ps => used.add(ps.numero_giocatore));
+
     for (let i = 1; i <= this.maxClients; i++) {
       if (!used.has(i)) {
         const sid = `BOT_${this.roomId}_${i}`;
@@ -427,13 +507,12 @@ export class DerbyRoom extends Room<DerbyState> {
     }, ms);
   }
 
-  private _markLeaderboardDirty() { this.leaderboardDirty = true; }
+  private _markLeaderboardDirty() {
+    this.leaderboardDirty = true;
+  }
 
+  // se non hai logica wallet pronta, lasciala vuota e SAFE
   async _handleWalletSpend(_client: Client, _msg: any) {
-    // Se non hai logica pronta, lascia vuoto ma NON lanciare eccezioni
     return;
   }
-}
-
-  async _handleWalletSpend(client: Client, msg: any) { /* Logica esistente */ }
 }
