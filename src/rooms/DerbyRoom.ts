@@ -191,7 +191,7 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     /**
-     * ✅ FIX: handler "lancio" (il client lo invia al rilascio pallina)
+     * Handler "lancio" (il client lo invia al rilascio pallina)
      * Non aggiorna punti: serve solo per VFX o sync eventuale.
      */
     this.onMessage("lancio", (client, msg: any) => {
@@ -334,8 +334,13 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   onDispose() {
-    // sempre cleanup
     this._clearAllTimers();
+  }
+
+  // ✅ helper: nick winner sempre affidabile (anche senza loop su classifica)
+  private _getNicknameBySid(sid: string): string {
+    const ps = this.state.players.get(sid);
+    return (ps?.nickname ?? "").toString().slice(0, 24);
   }
 
   private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
@@ -347,10 +352,15 @@ export class DerbyRoom extends Room<DerbyState> {
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
     const finalBoard = this._buildLeaderboardPayload();
 
+    const winnerNick = this._getNicknameBySid(winnerSid);
+    const winnerPoints = this.puntiVittoria;
+
     this.broadcast("gara_finita", {
       matchId,
       winner: winnerSid,
       numero_giocatore: numero,
+      winner_points: winnerPoints, // ✅ nuovo
+      winner_nick: winnerNick,     // ✅ nuovo
       tempo,
       classifica: finalBoard
     });
