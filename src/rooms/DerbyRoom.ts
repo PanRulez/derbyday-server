@@ -64,6 +64,7 @@ type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
 
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
+
   countdownSeconds = 10;
   minimoGiocatori = 1;
   puntiVittoria = 21;
@@ -75,6 +76,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
   interval: NodeJS.Timeout | null = null;
   autostartTimeout: NodeJS.Timeout | null = null;
+
   bots: BotInfo[] = [];
 
   leaderboardTimer: NodeJS.Timeout | null = null;
@@ -93,7 +95,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this.setState(new DerbyState());
     this.autoDispose = true;
 
-    // kick inattivi
+    // kick inattivi (solo se non ricevono heartbeat/pos/punti ecc.)
     this.clock.setInterval(() => {
       const now = Date.now();
       this.clients.forEach(client => {
@@ -105,6 +107,11 @@ export class DerbyRoom extends Room<DerbyState> {
     }, 5000);
 
     /* ========== MESSAGGI CLIENT -> SERVER ========== */
+
+    // ✅ HEARTBEAT: evita kick quando il client non invia posizioni
+    this.onMessage("heartbeat", (client) => {
+      this.lastActivity.set(client.sessionId, Date.now());
+    });
 
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
       try {
@@ -174,6 +181,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.onMessage("set_nickname", (client, nick: string) => {
       try {
+        this.lastActivity.set(client.sessionId, Date.now());
         const p = this.state.players.get(client.sessionId);
         if (p) p.nickname = (nick ?? "").toString().slice(0, 24);
         this._markLeaderboardDirty();
@@ -191,8 +199,7 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     /**
-     * Handler "lancio" (il client lo invia al rilascio pallina)
-     * Non aggiorna punti: serve solo per VFX o sync eventuale.
+     * Handler "lancio" (solo sync/vfx)
      */
     this.onMessage("lancio", (client, msg: any) => {
       try {
@@ -208,7 +215,6 @@ export class DerbyRoom extends Room<DerbyState> {
         const x  = safeNum(msg?.x, p.x);
         const z  = safeNum(msg?.z, p.z);
 
-        // clamp per evitare valori assurdi
         const fxC = clamp(fx, -200, 200);
         const fzC = clamp(fz, -200, 200);
 
@@ -235,6 +241,9 @@ export class DerbyRoom extends Room<DerbyState> {
     });
   }
 
+  /* =========================
+     Countdown / Start match
+     ========================= */
   private _tryStartCountdown(_reason: string) {
     if (this.countdownStarted || this.matchLanciato || this.matchTerminato) return;
     if (this.clients.length < this.minimoGiocatori) return;
@@ -257,6 +266,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.matchLanciato = true;
     this.countdownStarted = false;
+
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
 
     this.lock();
@@ -273,6 +283,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }, BOT_START_DELAY_MS);
   }
 
+  /* =========================
+     Join / Leave
+     ========================= */
   onJoin(client: Client, options: any) {
     this.lastActivity.set(client.sessionId, Date.now());
 
@@ -283,6 +296,7 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     const numero = this._assignNumeroGiocatore();
+
     const p = new PlayerState();
     p.numero_giocatore = numero;
     p.nickname = String(options?.nickname || `Player ${numero}`).slice(0, 24);
@@ -315,13 +329,11 @@ export class DerbyRoom extends Room<DerbyState> {
       this.lastPosTs.delete(client.sessionId);
       this.sid2pf.delete(client.sessionId);
 
-      // rimuovi player dallo stato (importante, altrimenti rimane "fantasma")
       if (this.state.players.has(client.sessionId)) {
         this.state.players.delete(client.sessionId);
         this._markLeaderboardDirty();
       }
 
-      // se restano 0 client umani e match non terminato, chiudi
       const humansLeft = this.clients.length;
       if (humansLeft <= 0 && !this.matchTerminato) {
         this.matchTerminato = true;
@@ -337,7 +349,9 @@ export class DerbyRoom extends Room<DerbyState> {
     this._clearAllTimers();
   }
 
-  // ✅ helper: nick winner sempre affidabile (anche senza loop su classifica)
+  /* =========================
+     Fine gara
+     ========================= */
   private _getNicknameBySid(sid: string): string {
     const ps = this.state.players.get(sid);
     return (ps?.nickname ?? "").toString().slice(0, 24);
@@ -359,8 +373,8 @@ export class DerbyRoom extends Room<DerbyState> {
       matchId,
       winner: winnerSid,
       numero_giocatore: numero,
-      winner_points: winnerPoints, // ✅ nuovo
-      winner_nick: winnerNick,     // ✅ nuovo
+      winner_points: winnerPoints,
+      winner_nick: winnerNick,
       tempo,
       classifica: finalBoard
     });
@@ -392,6 +406,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }, 10000);
   }
 
+  /* =========================
+     Bots
+     ========================= */
   private _runBots(_startImmediate = false) {
     const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
 
@@ -440,6 +457,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
+  /* =========================
+     Timers cleanup
+     ========================= */
   private _clearAllTimers() {
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
@@ -447,6 +467,9 @@ export class DerbyRoom extends Room<DerbyState> {
     this.bots.forEach(b => { if (b.timer) clearInterval(b.timer); b.timer = undefined; });
   }
 
+  /* =========================
+     PlayFab helpers
+     ========================= */
   private async _pfAddCurrency(pfid: string, code: string, amount: number) {
     if (!PF_HOST || !PF_SECRET) return null;
 
@@ -473,6 +496,9 @@ export class DerbyRoom extends Room<DerbyState> {
     return json?.code === 200 ? json.data.VirtualCurrency : null;
   }
 
+  /* =========================
+     Player numbering / bots spawn
+     ========================= */
   private _assignNumeroGiocatore(): number {
     const used = new Set<number>();
     this.state.players.forEach(ps => used.add(ps.numero_giocatore));
@@ -496,6 +522,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
+  /* =========================
+     Leaderboard
+     ========================= */
   private _buildLeaderboardPayload() {
     const list: any[] = [];
     this.state.players.forEach((ps, sid) => list.push({
