@@ -12,6 +12,14 @@ const VC_PRIMARY = "CO";
 const VC_SECOND  = "GE";
 
 /* =========================
+   RANKING constants
+   ========================= */
+const RANK_STAT = "RankRating";
+const RANK_WIN_DELTA = 25;
+const RANK_LOSE_DELTA = -5;
+const RANK_MIN = 0; // non si può andare sotto
+
+/* =========================
    Parametri pista
    ========================= */
 const TRACK_X_START = 0.0;
@@ -185,7 +193,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
         this.broadcast("punteggio_aggiornato", {
           sessionId: client.sessionId,
-          numero_giocatore: p.numero_giocatore,
+          numero_giocatore: client ? p.numero_giocatore : 0,
           punti: p.punti
         });
 
@@ -439,6 +447,13 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     }
 
+    // ====== RANKING: aggiorna PlayFab solo per umani con PlayFabId ======
+    try {
+      await this._pfApplyRankAfterMatch(matchId, winnerSid);
+    } catch (e) {
+      console.error("[RANK] apply error:", e);
+    }
+
     // chiudi stanza dopo 10s (podio)
     setTimeout(() => {
       this.disconnect();
@@ -509,6 +524,7 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      PlayFab helpers
      ========================= */
+
   private async _pfAddCurrency(pfid: string, code: string, amount: number) {
     if (!PF_HOST || !PF_SECRET) return null;
 
@@ -533,6 +549,131 @@ export class DerbyRoom extends Room<DerbyState> {
 
     const json = await res.json().catch(() => null);
     return json?.code === 200 ? json.data.VirtualCurrency : null;
+  }
+
+  // ---- GET Rank
+  private async _pfGetRank(pfid: string): Promise<number> {
+    if (!PF_HOST || !PF_SECRET) return 0;
+    try {
+      const res = await fetch(`${PF_HOST}/Server/GetPlayerStatistics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          StatisticNames: [RANK_STAT],
+        }),
+      });
+      const json = await res.json().catch(() => null);
+      if (json?.code !== 200) return 0;
+      const stats = json?.data?.Statistics ?? [];
+      const found = stats.find((s: any) => s?.StatisticName === RANK_STAT);
+      return found && Number.isFinite(Number(found.Value)) ? Number(found.Value) : 0;
+    } catch (e) {
+      console.error("[PF][getRank] error:", e);
+      return 0;
+    }
+  }
+
+  // ---- Set Rank
+  private async _pfSetRank(pfid: string, newValue: number): Promise<boolean> {
+    if (!PF_HOST || !PF_SECRET) return false;
+    try {
+      const res = await fetch(`${PF_HOST}/Server/UpdatePlayerStatistics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }],
+        }),
+      });
+      const json = await res.json().catch(() => null);
+      return json?.code === 200;
+    } catch (e) {
+      console.error("[PF][setRank] error:", e);
+      return false;
+    }
+  }
+
+  // Idempotenza semplice: controlla ReadOnlyData.rank_last_match_id
+  private async _pfWasRankAlreadyApplied(pfid: string, matchId: string): Promise<boolean> {
+    if (!PF_HOST || !PF_SECRET) return false;
+    try {
+      const res = await fetch(`${PF_HOST}/Server/GetUserReadOnlyData`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        body: JSON.stringify({ PlayFabId: pfid, Keys: ["rank_last_match_id"] }),
+      });
+      const json = await res.json().catch(() => null);
+      if (json?.code !== 200) return false;
+      const last = json?.data?.Data?.rank_last_match_id?.Value ?? "";
+      return String(last) === String(matchId);
+    } catch (e) {
+      console.error("[PF][wasRankApplied] error:", e);
+      return false;
+    }
+  }
+
+  private async _pfMarkRankApplied(pfid: string, matchId: string, delta: number, value: number): Promise<void> {
+    if (!PF_HOST || !PF_SECRET) return;
+    try {
+      await fetch(`${PF_HOST}/Server/UpdateUserReadOnlyData`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          Data: {
+            rank_last_match_id: String(matchId),
+            rank_last_delta: String(delta),
+            rank_last_value: String(value),
+          },
+        }),
+      }).catch(() => null);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  /**
+   * Applica ranking: winner +25, altri umani -5.
+   * Idempotenza base: evita doppio accredito sullo stesso matchId (per utente).
+   */
+  private async _pfApplyRankAfterMatch(matchId: string, winnerSid: string) {
+    if (!PF_HOST || !PF_SECRET) return;
+
+    // lista umani presenti (solo chi ha PlayFabId)
+    const entries: Array<{ sid: string; pfid: string }> = [];
+    for (const c of this.clients) {
+      const pfid = this.sid2pf.get(c.sessionId);
+      if (pfid) entries.push({ sid: c.sessionId, pfid });
+    }
+
+    if (entries.length === 0) return;
+
+    // per ogni umano: calcola delta e aggiorna
+    await Promise.all(entries.map(async ({ sid, pfid }) => {
+      const delta = (sid === winnerSid) ? RANK_WIN_DELTA : RANK_LOSE_DELTA;
+
+      try {
+        const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
+        if (already) return;
+
+        const cur = await this._pfGetRank(pfid); // parte da 0 se non c'è
+        const next = Math.max(RANK_MIN, (cur + delta) | 0);
+
+        const ok = await this._pfSetRank(pfid, next);
+        if (ok) {
+          await this._pfMarkRankApplied(pfid, matchId, delta, next);
+        }
+
+        // (opzionale) manda sync al client
+        const cli = this.clients.find(x => x.sessionId === sid);
+        if (cli && ok) {
+          cli.send("rank_sync", { matchId, value: next, delta });
+        }
+      } catch (e) {
+        console.error("[RANK] update error:", pfid, e);
+      }
+    }));
   }
 
   /* =========================
