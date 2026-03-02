@@ -293,7 +293,58 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
   }
+func _on_wallet_sync(d) -> void:
+	if d == null:
+		return
 
+	# Il server manda: { totalCO, totalGE, reason? }
+	var new_balance := int(d.get("totalCO", 0))
+	var reason := String(d.get("reason", "sync"))
+	var delta := int(d.get("delta", 0)) # se non c'è, resta 0
+	var match_id := String(d.get("matchId", ""))
+
+	# ✅ aggiorna Wallet Autoload (il tuo Wallet.gd ha questa funzione perfetta)
+	var wallet: Node = get_node_or_null("/root/Wallet")
+	if wallet:
+		if wallet.has_method("apply_server_wallet_update"):
+			wallet.call("apply_server_wallet_update", new_balance, delta, reason, match_id)
+		elif wallet.has_method("set_coins"):
+			wallet.call("set_coins", new_balance)
+
+	# ✅ aggiorna subito UI Home se visibile
+	var home_nodes := get_tree().get_nodes_in_group("home_ui")
+	if home_nodes.size() > 0:
+		var home := home_nodes[0]
+		if home:
+			var co_label := home.get_node_or_null("CountBar/Legnetto2/COCount")
+			if co_label:
+				co_label.text = str(new_balance)
+
+
+func _on_coins_awarded(d) -> void:
+	# opzionale: toast in UI, per debug
+	if d == null:
+		return
+	var delta := int(d.get("delta", 0))
+	_log("coins_awarded delta=%d" % delta)
+
+
+func _on_rank_sync(d) -> void:
+	if d == null:
+		return
+
+	var val := int(d.get("value", 0))
+	var delta := int(d.get("delta", 0))
+
+	var home_nodes := get_tree().get_nodes_in_group("home_ui")
+	if home_nodes.size() > 0:
+		var home := home_nodes[0]
+		if home and home.has_method("on_rank_changed"):
+			home.call("on_rank_changed", delta, val)
+		elif home:
+			var rk := home.get_node_or_null("CountBar/Legnetto1/RKCount")
+			if rk:
+				rk.text = str(val)
   /* =========================
      Countdown / Start match
      ========================= */
