@@ -26,14 +26,15 @@ const TRACK_X_START = 0.0;
 const STEP_X = 42.85;
 
 /* =========================
-   Tuning bot
+   Tuning bot (PIÙ LENTI)
    ========================= */
-const BOT_BASE_MS_MIN = 3000;
-const BOT_BASE_MS_MAX = 6000;
+const BOT_BASE_MS_MIN = 4500;
+const BOT_BASE_MS_MAX = 9000;
 
+// più 1, poche 2, rarissime 4
 const BOT_WEIGHTS = [
-  { s: 1, w: 85 },
-  { s: 2, w: 14 },
+  { s: 1, w: 92 },
+  { s: 2, w: 7 },
   { s: 4, w: 1 },
 ];
 
@@ -63,7 +64,7 @@ class PlayerState extends Schema {
   @type("number") punti: number = 0;
   @type("string") nickname: string = "";
 
-  // ✅ NEW: cosmetica (0..23)
+  // ✅ cosmetica (0..23)
   @type("number") skin_id: number = 0;
 }
 
@@ -102,11 +103,14 @@ export class DerbyRoom extends Room<DerbyState> {
   private lastActivity = new Map<string, number>();
   private readonly INACTIVITY_TIMEOUT = 60000;
 
+  // ✅ CO guadagnati in questa partita (somma buche 1/2/4)
+  private matchEarnedCO = new Map<string, number>(); // sid -> earned
+
   onCreate() {
     this.setState(new DerbyState());
     this.autoDispose = true;
 
-    // kick inattivi (solo se non ricevono heartbeat/pos/punti ecc.)
+    // kick inattivi
     this.clock.setInterval(() => {
       const now = Date.now();
       this.clients.forEach(client => {
@@ -119,12 +123,10 @@ export class DerbyRoom extends Room<DerbyState> {
 
     /* ========== MESSAGGI CLIENT -> SERVER ========== */
 
-    // ✅ HEARTBEAT: evita kick quando il client non invia posizioni
     this.onMessage("heartbeat", (client) => {
       this.lastActivity.set(client.sessionId, Date.now());
     });
 
-    // ✅ NEW: set_skin (cosmetica)
     this.onMessage("set_skin", (client, msg: { skin_id: number }) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
@@ -134,7 +136,6 @@ export class DerbyRoom extends Room<DerbyState> {
         const skin = clamp((safeNum(msg?.skin_id, 0) | 0), 0, 23);
         p.skin_id = skin;
 
-        // broadcast a tutti
         this.broadcast("skin_update", {
           sessionId: client.sessionId,
           numero_giocatore: p.numero_giocatore,
@@ -177,6 +178,12 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
+    /**
+     * ✅ CO dalle buche (anti-cheat):
+     * - client manda "totale punti"
+     * - server accetta SOLO incrementi 0..4 per singolo update (1/2/4)
+     * - accumula CO = delta (1/2/4)
+     */
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
@@ -185,15 +192,30 @@ export class DerbyRoom extends Room<DerbyState> {
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
 
-        const target = Math.min(Math.max((nuovi_punti | 0), 0), this.puntiVittoria);
         const old = p.punti;
+
+        const requested = Math.min(Math.max((nuovi_punti | 0), 0), this.puntiVittoria);
+
+        // delta richiesto (solo +)
+        let delta = (requested - old) | 0;
+
+        // accetta SOLO 0..4 (una buca)
+        delta = clamp(delta, 0, 4);
+
+        const target = Math.min(old + delta, this.puntiVittoria);
+
+        if (target === old) return;
 
         p.punti = target;
         p.x = TRACK_X_START + (STEP_X * p.punti);
 
+        // accumula CO solo per umani (i bot non mandano aggiorna_punti)
+        const prevCO = this.matchEarnedCO.get(client.sessionId) ?? 0;
+        this.matchEarnedCO.set(client.sessionId, prevCO + delta);
+
         this.broadcast("punteggio_aggiornato", {
           sessionId: client.sessionId,
-          numero_giocatore: client ? p.numero_giocatore : 0,
+          numero_giocatore: p.numero_giocatore,
           punti: p.punti
         });
 
@@ -232,9 +254,6 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
-    /**
-     * Handler "lancio" (solo sync/vfx)
-     */
     this.onMessage("lancio", (client, msg: any) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
@@ -307,6 +326,9 @@ export class DerbyRoom extends Room<DerbyState> {
     this._spawnBotsIfNeeded();
     this.matchId = `${this.roomId}-${Date.now()}`;
 
+    // ✅ reset CO partita
+    this.matchEarnedCO.clear();
+
     this.broadcast("match_started", { matchId: this.matchId });
     this.broadcast("inizia_match");
 
@@ -334,12 +356,12 @@ export class DerbyRoom extends Room<DerbyState> {
     const p = new PlayerState();
     p.numero_giocatore = numero;
     p.nickname = String(options?.nickname || `Player ${numero}`).slice(0, 24);
-    // skin_id resta default (0) finché il client non manda set_skin
     this.state.players.set(client.sessionId, p);
 
     const pfid = String(options?.playfabId || "");
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
+
       this._pfGetBalances(pfid)
         .then(vc => {
           if (vc) client.send("wallet_sync", {
@@ -352,7 +374,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     client.send("numero_giocatore", numero);
 
-    // ✅ NEW: manda al nuovo client lo snapshot delle skin conosciute (inclusi bot/umani presenti)
+    // skins snapshot
     const skins: any[] = [];
     this.state.players.forEach((ps, sid) => {
       skins.push({
@@ -375,6 +397,7 @@ export class DerbyRoom extends Room<DerbyState> {
       this.lastActivity.delete(client.sessionId);
       this.lastPosTs.delete(client.sessionId);
       this.sid2pf.delete(client.sessionId);
+      this.matchEarnedCO.delete(client.sessionId);
 
       if (this.state.players.has(client.sessionId)) {
         this.state.players.delete(client.sessionId);
@@ -426,35 +449,40 @@ export class DerbyRoom extends Room<DerbyState> {
       classifica: finalBoard
     });
 
-    // accredito PlayFab solo se winner è umano
-    if (!winnerSid.startsWith("BOT_")) {
-      const pfid = this.sid2pf.get(winnerSid);
-      if (pfid && PF_HOST && PF_SECRET) {
-        try {
-          const newTotals = await this._pfAddCurrency(pfid, VC_PRIMARY, 20);
-          const cli = this.clients.find(c => c.sessionId === winnerSid);
-          if (cli && newTotals) {
-            cli.send("wallet_sync", {
-              totalCO: newTotals[VC_PRIMARY] ?? 0,
-              totalGE: newTotals[VC_SECOND] ?? 0,
-              reason: "win"
-            });
-            cli.send("coins_awarded", { matchId, delta: 20 });
-          }
-        } catch (e) {
-          console.error("[PF] Error:", e);
+    // ====== CO: accredito in base alle buche (somma 1/2/4) ======
+    try {
+      await Promise.all(this.clients.map(async (cli) => {
+        const sid = cli.sessionId;
+        if (sid.startsWith("BOT_")) return;
+
+        const pfid = this.sid2pf.get(sid);
+        if (!pfid || !PF_HOST || !PF_SECRET) return;
+
+        const earned = this.matchEarnedCO.get(sid) ?? 0;
+        if (earned <= 0) return;
+
+        const newTotals = await this._pfAddCurrency(pfid, VC_PRIMARY, earned);
+        if (newTotals) {
+          cli.send("wallet_sync", {
+            totalCO: newTotals[VC_PRIMARY] ?? 0,
+            totalGE: newTotals[VC_SECOND] ?? 0,
+            reason: "holes"
+          });
+          cli.send("coins_awarded", { matchId, delta: earned });
         }
-      }
+      }));
+    } catch (e) {
+      console.error("[CO] holes payout error:", e);
     }
 
-    // ====== RANKING: aggiorna PlayFab solo per umani con PlayFabId ======
+    // ====== RANKING: winner +25, altri -5 (min 0) ======
     try {
       await this._pfApplyRankAfterMatch(matchId, winnerSid);
     } catch (e) {
       console.error("[RANK] apply error:", e);
     }
 
-    // chiudi stanza dopo 10s (podio)
+    // chiudi stanza dopo 10s
     setTimeout(() => {
       this.disconnect();
     }, 10000);
@@ -551,7 +579,6 @@ export class DerbyRoom extends Room<DerbyState> {
     return json?.code === 200 ? json.data.VirtualCurrency : null;
   }
 
-  // ---- GET Rank
   private async _pfGetRank(pfid: string): Promise<number> {
     if (!PF_HOST || !PF_SECRET) return 0;
     try {
@@ -574,7 +601,6 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  // ---- Set Rank
   private async _pfSetRank(pfid: string, newValue: number): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
     try {
@@ -594,7 +620,6 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  // Idempotenza semplice: controlla ReadOnlyData.rank_last_match_id
   private async _pfWasRankAlreadyApplied(pfid: string, matchId: string): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
     try {
@@ -628,19 +653,14 @@ export class DerbyRoom extends Room<DerbyState> {
           },
         }),
       }).catch(() => null);
-    } catch (e) {
+    } catch {
       // ignore
     }
   }
 
-  /**
-   * Applica ranking: winner +25, altri umani -5.
-   * Idempotenza base: evita doppio accredito sullo stesso matchId (per utente).
-   */
   private async _pfApplyRankAfterMatch(matchId: string, winnerSid: string) {
     if (!PF_HOST || !PF_SECRET) return;
 
-    // lista umani presenti (solo chi ha PlayFabId)
     const entries: Array<{ sid: string; pfid: string }> = [];
     for (const c of this.clients) {
       const pfid = this.sid2pf.get(c.sessionId);
@@ -649,7 +669,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     if (entries.length === 0) return;
 
-    // per ogni umano: calcola delta e aggiorna
     await Promise.all(entries.map(async ({ sid, pfid }) => {
       const delta = (sid === winnerSid) ? RANK_WIN_DELTA : RANK_LOSE_DELTA;
 
@@ -657,7 +676,7 @@ export class DerbyRoom extends Room<DerbyState> {
         const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
         if (already) return;
 
-        const cur = await this._pfGetRank(pfid); // parte da 0 se non c'è
+        const cur = await this._pfGetRank(pfid);
         const next = Math.max(RANK_MIN, (cur + delta) | 0);
 
         const ok = await this._pfSetRank(pfid, next);
@@ -665,7 +684,6 @@ export class DerbyRoom extends Room<DerbyState> {
           await this._pfMarkRankApplied(pfid, matchId, delta, next);
         }
 
-        // (opzionale) manda sync al client
         const cli = this.clients.find(x => x.sessionId === sid);
         if (cli && ok) {
           cli.send("rank_sync", { matchId, value: next, delta });
@@ -696,7 +714,6 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = new PlayerState();
         ps.numero_giocatore = i;
         ps.nickname = `BOT ${i}`;
-        // ps.skin_id resta 0 (default) per ora
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
       }
@@ -714,7 +731,6 @@ export class DerbyRoom extends Room<DerbyState> {
       nickname: ps.nickname,
       punti: ps.punti,
       x: ps.x
-      // (non metto skin qui, non serve)
     }));
     return list.sort((a, b) => b.punti - a.punti || b.x - a.x);
   }
@@ -732,7 +748,6 @@ export class DerbyRoom extends Room<DerbyState> {
     this.leaderboardDirty = true;
   }
 
-  // se non hai logica wallet pronta, lasciala vuota e SAFE
   async _handleWalletSpend(_client: Client, _msg: any) {
     return;
   }
