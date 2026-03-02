@@ -12,26 +12,25 @@ const VC_PRIMARY = "CO";
 const VC_SECOND  = "GE";
 
 /* =========================
-   RANKING constants
+   RANKING
    ========================= */
 const RANK_STAT = "RankRating";
 const RANK_WIN_DELTA = 25;
 const RANK_LOSE_DELTA = -5;
-const RANK_MIN = 0; // non si può andare sotto
+const RANK_MIN = 0;
 
 /* =========================
-   Parametri pista
+   Track
    ========================= */
 const TRACK_X_START = 0.0;
 const STEP_X = 42.85;
 
 /* =========================
-   Tuning bot (PIÙ LENTI)
+   Bots (più lenti)
    ========================= */
 const BOT_BASE_MS_MIN = 4500;
 const BOT_BASE_MS_MAX = 9000;
 
-// più 1, poche 2, rarissime 4
 const BOT_WEIGHTS = [
   { s: 1, w: 92 },
   { s: 2, w: 7 },
@@ -42,13 +41,12 @@ const BOT_POS_UPDATES = true;
 const BOT_START_DELAY_MS = 4500;
 
 /* =========================
-   Helpers safety
+   Helpers
    ========================= */
 function safeNum(v: any, fallback = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
-
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
@@ -63,8 +61,6 @@ class PlayerState extends Schema {
   @type("number") z: number = 0;
   @type("number") punti: number = 0;
   @type("string") nickname: string = "";
-
-  // ✅ cosmetica (0..23)
   @type("number") skin_id: number = 0;
 }
 
@@ -87,13 +83,10 @@ export class DerbyRoom extends Room<DerbyState> {
   tempoRimanente = this.countdownSeconds;
 
   interval: NodeJS.Timeout | null = null;
-  autostartTimeout: NodeJS.Timeout | null = null;
-
-  bots: BotInfo[] = [];
-
   leaderboardTimer: NodeJS.Timeout | null = null;
   leaderboardDirty = false;
 
+  bots: BotInfo[] = [];
   matchId: string | null = null;
 
   private sid2pf = new Map<string, string>();
@@ -179,10 +172,9 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     /**
-     * ✅ CO dalle buche (anti-cheat):
-     * - client manda "totale punti"
-     * - server accetta SOLO incrementi 0..4 per singolo update (1/2/4)
-     * - accumula CO = delta (1/2/4)
+     * ✅ client manda: "totale punti"
+     * ✅ server accetta solo +0..4 per update (1/2/4)
+     * ✅ CO partita = delta
      */
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       try {
@@ -193,23 +185,18 @@ export class DerbyRoom extends Room<DerbyState> {
         if (!p) return;
 
         const old = p.punti;
-
         const requested = Math.min(Math.max((nuovi_punti | 0), 0), this.puntiVittoria);
 
-        // delta richiesto (solo +)
         let delta = (requested - old) | 0;
-
-        // accetta SOLO 0..4 (una buca)
         delta = clamp(delta, 0, 4);
 
         const target = Math.min(old + delta, this.puntiVittoria);
-
         if (target === old) return;
 
         p.punti = target;
         p.x = TRACK_X_START + (STEP_X * p.punti);
 
-        // accumula CO solo per umani (i bot non mandano aggiorna_punti)
+        // CO accumulati in match
         const prevCO = this.matchEarnedCO.get(client.sessionId) ?? 0;
         this.matchEarnedCO.set(client.sessionId, prevCO + delta);
 
@@ -280,73 +267,10 @@ export class DerbyRoom extends Room<DerbyState> {
         console.error("[lancio] error:", e);
       }
     });
-
-    this.onMessage("wallet_spend", (client, msg) => {
-      try {
-        this.lastActivity.set(client.sessionId, Date.now());
-        const maybePromise = this._handleWalletSpend(client, msg);
-        if (maybePromise && typeof (maybePromise as any).catch === "function") {
-          (maybePromise as any).catch((err: any) => console.error("[wallet_spend] error:", err));
-        }
-      } catch (e) {
-        console.error("[wallet_spend] error:", e);
-      }
-    });
   }
-func _on_wallet_sync(d) -> void:
-	if d == null:
-		return
 
-	# Il server manda: { totalCO, totalGE, reason? }
-	var new_balance := int(d.get("totalCO", 0))
-	var reason := String(d.get("reason", "sync"))
-	var delta := int(d.get("delta", 0)) # se non c'è, resta 0
-	var match_id := String(d.get("matchId", ""))
-
-	# ✅ aggiorna Wallet Autoload (il tuo Wallet.gd ha questa funzione perfetta)
-	var wallet: Node = get_node_or_null("/root/Wallet")
-	if wallet:
-		if wallet.has_method("apply_server_wallet_update"):
-			wallet.call("apply_server_wallet_update", new_balance, delta, reason, match_id)
-		elif wallet.has_method("set_coins"):
-			wallet.call("set_coins", new_balance)
-
-	# ✅ aggiorna subito UI Home se visibile
-	var home_nodes := get_tree().get_nodes_in_group("home_ui")
-	if home_nodes.size() > 0:
-		var home := home_nodes[0]
-		if home:
-			var co_label := home.get_node_or_null("CountBar/Legnetto2/COCount")
-			if co_label:
-				co_label.text = str(new_balance)
-
-
-func _on_coins_awarded(d) -> void:
-	# opzionale: toast in UI, per debug
-	if d == null:
-		return
-	var delta := int(d.get("delta", 0))
-	_log("coins_awarded delta=%d" % delta)
-
-
-func _on_rank_sync(d) -> void:
-	if d == null:
-		return
-
-	var val := int(d.get("value", 0))
-	var delta := int(d.get("delta", 0))
-
-	var home_nodes := get_tree().get_nodes_in_group("home_ui")
-	if home_nodes.size() > 0:
-		var home := home_nodes[0]
-		if home and home.has_method("on_rank_changed"):
-			home.call("on_rank_changed", delta, val)
-		elif home:
-			var rk := home.get_node_or_null("CountBar/Legnetto1/RKCount")
-			if rk:
-				rk.text = str(val)
   /* =========================
-     Countdown / Start match
+     Countdown / Start
      ========================= */
   private _tryStartCountdown(_reason: string) {
     if (this.countdownStarted || this.matchLanciato || this.matchTerminato) return;
@@ -377,7 +301,7 @@ func _on_rank_sync(d) -> void:
     this._spawnBotsIfNeeded();
     this.matchId = `${this.roomId}-${Date.now()}`;
 
-    // ✅ reset CO partita
+    // reset CO match
     this.matchEarnedCO.clear();
 
     this.broadcast("match_started", { matchId: this.matchId });
@@ -386,7 +310,7 @@ func _on_rank_sync(d) -> void:
     this._startLeaderboardTicker(300);
 
     setTimeout(() => {
-      if (!this.matchTerminato) this._runBots(true);
+      if (!this.matchTerminato) this._runBots();
     }, BOT_START_DELAY_MS);
   }
 
@@ -417,7 +341,8 @@ func _on_rank_sync(d) -> void:
         .then(vc => {
           if (vc) client.send("wallet_sync", {
             totalCO: vc[VC_PRIMARY] ?? 0,
-            totalGE: vc[VC_SECOND] ?? 0
+            totalGE: vc[VC_SECOND] ?? 0,
+            reason: "join"
           });
         })
         .catch(err => console.error("[_pfGetBalances] error:", err));
@@ -488,19 +413,18 @@ func _on_rank_sync(d) -> void:
     const finalBoard = this._buildLeaderboardPayload();
 
     const winnerNick = this._getNicknameBySid(winnerSid);
-    const winnerPoints = this.puntiVittoria;
 
     this.broadcast("gara_finita", {
       matchId,
       winner: winnerSid,
       numero_giocatore: numero,
-      winner_points: winnerPoints,
+      winner_points: this.puntiVittoria,
       winner_nick: winnerNick,
       tempo,
       classifica: finalBoard
     });
 
-    // ====== CO: accredito in base alle buche (somma 1/2/4) ======
+    // ====== CO payout (buche) ======
     try {
       await Promise.all(this.clients.map(async (cli) => {
         const sid = cli.sessionId;
@@ -517,32 +441,31 @@ func _on_rank_sync(d) -> void:
           cli.send("wallet_sync", {
             totalCO: newTotals[VC_PRIMARY] ?? 0,
             totalGE: newTotals[VC_SECOND] ?? 0,
-            reason: "holes"
+            reason: "holes",
+            delta: earned,
+            matchId
           });
           cli.send("coins_awarded", { matchId, delta: earned });
         }
       }));
     } catch (e) {
-      console.error("[CO] holes payout error:", e);
+      console.error("[CO] payout error:", e);
     }
 
-    // ====== RANKING: winner +25, altri -5 (min 0) ======
+    // ====== RANK payout ======
     try {
       await this._pfApplyRankAfterMatch(matchId, winnerSid);
     } catch (e) {
       console.error("[RANK] apply error:", e);
     }
 
-    // chiudi stanza dopo 10s
-    setTimeout(() => {
-      this.disconnect();
-    }, 10000);
+    setTimeout(() => this.disconnect(), 10000);
   }
 
   /* =========================
      Bots
      ========================= */
-  private _runBots(_startImmediate = false) {
+  private _runBots() {
     const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
 
     for (const bot of this.bots) {
@@ -595,7 +518,6 @@ func _on_rank_sync(d) -> void:
      ========================= */
   private _clearAllTimers() {
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
-    if (this.autostartTimeout) { clearTimeout(this.autostartTimeout); this.autostartTimeout = null; }
     if (this.leaderboardTimer) { clearInterval(this.leaderboardTimer); this.leaderboardTimer = null; }
     this.bots.forEach(b => { if (b.timer) clearInterval(b.timer); b.timer = undefined; });
   }
@@ -603,7 +525,6 @@ func _on_rank_sync(d) -> void:
   /* =========================
      PlayFab helpers
      ========================= */
-
   private async _pfAddCurrency(pfid: string, code: string, amount: number) {
     if (!PF_HOST || !PF_SECRET) return null;
 
@@ -636,18 +557,14 @@ func _on_rank_sync(d) -> void:
       const res = await fetch(`${PF_HOST}/Server/GetPlayerStatistics`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-        body: JSON.stringify({
-          PlayFabId: pfid,
-          StatisticNames: [RANK_STAT],
-        }),
+        body: JSON.stringify({ PlayFabId: pfid, StatisticNames: [RANK_STAT] }),
       });
       const json = await res.json().catch(() => null);
       if (json?.code !== 200) return 0;
       const stats = json?.data?.Statistics ?? [];
       const found = stats.find((s: any) => s?.StatisticName === RANK_STAT);
       return found && Number.isFinite(Number(found.Value)) ? Number(found.Value) : 0;
-    } catch (e) {
-      console.error("[PF][getRank] error:", e);
+    } catch {
       return 0;
     }
   }
@@ -658,15 +575,11 @@ func _on_rank_sync(d) -> void:
       const res = await fetch(`${PF_HOST}/Server/UpdatePlayerStatistics`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-        body: JSON.stringify({
-          PlayFabId: pfid,
-          Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }],
-        }),
+        body: JSON.stringify({ PlayFabId: pfid, Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }] }),
       });
       const json = await res.json().catch(() => null);
       return json?.code === 200;
-    } catch (e) {
-      console.error("[PF][setRank] error:", e);
+    } catch {
       return false;
     }
   }
@@ -683,8 +596,7 @@ func _on_rank_sync(d) -> void:
       if (json?.code !== 200) return false;
       const last = json?.data?.Data?.rank_last_match_id?.Value ?? "";
       return String(last) === String(matchId);
-    } catch (e) {
-      console.error("[PF][wasRankApplied] error:", e);
+    } catch {
       return false;
     }
   }
@@ -704,9 +616,7 @@ func _on_rank_sync(d) -> void:
           },
         }),
       }).catch(() => null);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   private async _pfApplyRankAfterMatch(matchId: string, winnerSid: string) {
@@ -717,62 +627,29 @@ func _on_rank_sync(d) -> void:
       const pfid = this.sid2pf.get(c.sessionId);
       if (pfid) entries.push({ sid: c.sessionId, pfid });
     }
-
     if (entries.length === 0) return;
 
     await Promise.all(entries.map(async ({ sid, pfid }) => {
       const delta = (sid === winnerSid) ? RANK_WIN_DELTA : RANK_LOSE_DELTA;
 
-      try {
-        const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
-        if (already) return;
+      const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
+      if (already) return;
 
-        const cur = await this._pfGetRank(pfid);
-        const next = Math.max(RANK_MIN, (cur + delta) | 0);
+      const cur = await this._pfGetRank(pfid);
+      const next = Math.max(RANK_MIN, (cur + delta) | 0);
 
-        const ok = await this._pfSetRank(pfid, next);
-        if (ok) {
-          await this._pfMarkRankApplied(pfid, matchId, delta, next);
-        }
+      const ok = await this._pfSetRank(pfid, next);
+      if (ok) await this._pfMarkRankApplied(pfid, matchId, delta, next);
 
-        const cli = this.clients.find(x => x.sessionId === sid);
-        if (cli && ok) {
-          cli.send("rank_sync", { matchId, value: next, delta });
-        }
-      } catch (e) {
-        console.error("[RANK] update error:", pfid, e);
+      const cli = this.clients.find(x => x.sessionId === sid);
+      if (cli && ok) {
+        cli.send("rank_sync", { matchId, value: next, delta });
       }
     }));
   }
 
   /* =========================
-     Player numbering / bots spawn
-     ========================= */
-  private _assignNumeroGiocatore(): number {
-    const used = new Set<number>();
-    this.state.players.forEach(ps => used.add(ps.numero_giocatore));
-    for (let i = 1; i <= this.maxClients; i++) if (!used.has(i)) return i;
-    return 1;
-  }
-
-  private _spawnBotsIfNeeded() {
-    const used = new Set<number>();
-    this.state.players.forEach(ps => used.add(ps.numero_giocatore));
-
-    for (let i = 1; i <= this.maxClients; i++) {
-      if (!used.has(i)) {
-        const sid = `BOT_${this.roomId}_${i}`;
-        const ps = new PlayerState();
-        ps.numero_giocatore = i;
-        ps.nickname = `BOT ${i}`;
-        this.state.players.set(sid, ps);
-        this.bots.push({ sid, numero: i });
-      }
-    }
-  }
-
-  /* =========================
-     Leaderboard
+     Leaderboard helpers
      ========================= */
   private _buildLeaderboardPayload() {
     const list: any[] = [];
@@ -799,7 +676,26 @@ func _on_rank_sync(d) -> void:
     this.leaderboardDirty = true;
   }
 
-  async _handleWalletSpend(_client: Client, _msg: any) {
-    return;
+  private _assignNumeroGiocatore(): number {
+    const used = new Set<number>();
+    this.state.players.forEach(ps => used.add(ps.numero_giocatore));
+    for (let i = 1; i <= this.maxClients; i++) if (!used.has(i)) return i;
+    return 1;
+  }
+
+  private _spawnBotsIfNeeded() {
+    const used = new Set<number>();
+    this.state.players.forEach(ps => used.add(ps.numero_giocatore));
+
+    for (let i = 1; i <= this.maxClients; i++) {
+      if (!used.has(i)) {
+        const sid = `BOT_${this.roomId}_${i}`;
+        const ps = new PlayerState();
+        ps.numero_giocatore = i;
+        ps.nickname = `BOT ${i}`;
+        this.state.players.set(sid, ps);
+        this.bots.push({ sid, numero: i });
+      }
+    }
   }
 }
