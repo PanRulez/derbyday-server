@@ -54,6 +54,9 @@ class PlayerState extends Schema {
   @type("number") z: number = 0;
   @type("number") punti: number = 0;
   @type("string") nickname: string = "";
+
+  // ✅ NEW: cosmetica (0..23)
+  @type("number") skin_id: number = 0;
 }
 
 class DerbyState extends Schema {
@@ -111,6 +114,29 @@ export class DerbyRoom extends Room<DerbyState> {
     // ✅ HEARTBEAT: evita kick quando il client non invia posizioni
     this.onMessage("heartbeat", (client) => {
       this.lastActivity.set(client.sessionId, Date.now());
+    });
+
+    // ✅ NEW: set_skin (cosmetica)
+    this.onMessage("set_skin", (client, msg: { skin_id: number }) => {
+      try {
+        this.lastActivity.set(client.sessionId, Date.now());
+        const p = this.state.players.get(client.sessionId);
+        if (!p) return;
+
+        const skin = clamp((safeNum(msg?.skin_id, 0) | 0), 0, 23);
+        p.skin_id = skin;
+
+        // broadcast a tutti
+        this.broadcast("skin_update", {
+          sessionId: client.sessionId,
+          numero_giocatore: p.numero_giocatore,
+          skin_id: p.skin_id
+        });
+
+        this._markLeaderboardDirty();
+      } catch (e) {
+        console.error("[set_skin] error:", e);
+      }
     });
 
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
@@ -300,6 +326,7 @@ export class DerbyRoom extends Room<DerbyState> {
     const p = new PlayerState();
     p.numero_giocatore = numero;
     p.nickname = String(options?.nickname || `Player ${numero}`).slice(0, 24);
+    // skin_id resta default (0) finché il client non manda set_skin
     this.state.players.set(client.sessionId, p);
 
     const pfid = String(options?.playfabId || "");
@@ -316,6 +343,18 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     client.send("numero_giocatore", numero);
+
+    // ✅ NEW: manda al nuovo client lo snapshot delle skin conosciute (inclusi bot/umani presenti)
+    const skins: any[] = [];
+    this.state.players.forEach((ps, sid) => {
+      skins.push({
+        sessionId: sid,
+        numero_giocatore: ps.numero_giocatore,
+        skin_id: ps.skin_id ?? 0
+      });
+    });
+    client.send("skins_snapshot", skins);
+
     this._markLeaderboardDirty();
 
     if (!this.countdownStarted && this.clients.length >= this.minimoGiocatori) {
@@ -516,6 +555,7 @@ export class DerbyRoom extends Room<DerbyState> {
         const ps = new PlayerState();
         ps.numero_giocatore = i;
         ps.nickname = `BOT ${i}`;
+        // ps.skin_id resta 0 (default) per ora
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
       }
@@ -533,6 +573,7 @@ export class DerbyRoom extends Room<DerbyState> {
       nickname: ps.nickname,
       punti: ps.punti,
       x: ps.x
+      // (non metto skin qui, non serve)
     }));
     return list.sort((a, b) => b.punti - a.punti || b.x - a.x);
   }
