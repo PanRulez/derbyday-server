@@ -196,7 +196,6 @@ export class DerbyRoom extends Room<DerbyState> {
         p.punti = target;
         p.x = TRACK_X_START + (STEP_X * p.punti);
 
-        // CO accumulati in match
         const prevCO = this.matchEarnedCO.get(client.sessionId) ?? 0;
         this.matchEarnedCO.set(client.sessionId, prevCO + delta);
 
@@ -337,6 +336,7 @@ export class DerbyRoom extends Room<DerbyState> {
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
 
+      // saldo
       this._pfGetBalances(pfid)
         .then(vc => {
           if (vc) client.send("wallet_sync", {
@@ -346,6 +346,13 @@ export class DerbyRoom extends Room<DerbyState> {
           });
         })
         .catch(err => console.error("[_pfGetBalances] error:", err));
+
+      // ✅ rank sync immediato (delta=0)
+      this._pfGetRank(pfid)
+        .then(curRank => {
+          client.send("rank_sync", { matchId: "", value: (curRank ?? 0) | 0, delta: 0 });
+        })
+        .catch(err => console.error("[_pfGetRank][onJoin] error:", err));
     }
 
     client.send("numero_giocatore", numero);
@@ -411,7 +418,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
     const finalBoard = this._buildLeaderboardPayload();
-
     const winnerNick = this._getNicknameBySid(winnerSid);
 
     this.broadcast("gara_finita", {
@@ -560,26 +566,55 @@ export class DerbyRoom extends Room<DerbyState> {
         body: JSON.stringify({ PlayFabId: pfid, StatisticNames: [RANK_STAT] }),
       });
       const json = await res.json().catch(() => null);
-      if (json?.code !== 200) return 0;
+      if (json?.code !== 200) {
+        console.error("[PF][getRank] FAILED:", {
+          http: res.status,
+          code: json?.code,
+          error: json?.error,
+          errorMessage: json?.errorMessage,
+          pfid
+        });
+        return 0;
+      }
       const stats = json?.data?.Statistics ?? [];
       const found = stats.find((s: any) => s?.StatisticName === RANK_STAT);
       return found && Number.isFinite(Number(found.Value)) ? Number(found.Value) : 0;
-    } catch {
+    } catch (e) {
+      console.error("[PF][getRank] error:", e);
       return 0;
     }
   }
 
+  // ✅ QUI LOGGHIAMO il motivo se non aggiorna
   private async _pfSetRank(pfid: string, newValue: number): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
     try {
       const res = await fetch(`${PF_HOST}/Server/UpdatePlayerStatistics`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-        body: JSON.stringify({ PlayFabId: pfid, Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }] }),
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }]
+        }),
       });
+
       const json = await res.json().catch(() => null);
-      return json?.code === 200;
-    } catch {
+
+      if (json?.code !== 200) {
+        console.error("[PF][setRank] FAILED:", {
+          http: res.status,
+          code: json?.code,
+          error: json?.error,
+          errorMessage: json?.errorMessage,
+          pfid,
+          newValue
+        });
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      console.error("[PF][setRank] error:", e);
       return false;
     }
   }
@@ -596,7 +631,8 @@ export class DerbyRoom extends Room<DerbyState> {
       if (json?.code !== 200) return false;
       const last = json?.data?.Data?.rank_last_match_id?.Value ?? "";
       return String(last) === String(matchId);
-    } catch {
+    } catch (e) {
+      console.error("[PF][wasRankApplied] error:", e);
       return false;
     }
   }
@@ -616,34 +652,56 @@ export class DerbyRoom extends Room<DerbyState> {
           },
         }),
       }).catch(() => null);
-    } catch {}
+    } catch (e) {
+      console.error("[PF][markRankApplied] error:", e);
+    }
   }
 
   private async _pfApplyRankAfterMatch(matchId: string, winnerSid: string) {
-    if (!PF_HOST || !PF_SECRET) return;
+    if (!PF_HOST || !PF_SECRET) {
+      console.error("[RANK] PF env missing (PF_HOST/PF_SECRET).");
+      return;
+    }
 
     const entries: Array<{ sid: string; pfid: string }> = [];
     for (const c of this.clients) {
       const pfid = this.sid2pf.get(c.sessionId);
       if (pfid) entries.push({ sid: c.sessionId, pfid });
     }
-    if (entries.length === 0) return;
+
+    if (entries.length === 0) {
+      console.error("[RANK] No human entries with playfabId.");
+      return;
+    }
 
     await Promise.all(entries.map(async ({ sid, pfid }) => {
       const delta = (sid === winnerSid) ? RANK_WIN_DELTA : RANK_LOSE_DELTA;
 
-      const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
-      if (already) return;
+      try {
+        const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
+        if (already) {
+          // manda comunque sync al client (utile se UI non era aggiornata)
+          const cur = await this._pfGetRank(pfid);
+          const cli = this.clients.find(x => x.sessionId === sid);
+          if (cli) cli.send("rank_sync", { matchId, value: cur | 0, delta: 0 });
+          return;
+        }
 
-      const cur = await this._pfGetRank(pfid);
-      const next = Math.max(RANK_MIN, (cur + delta) | 0);
+        const cur = await this._pfGetRank(pfid);
+        const next = Math.max(RANK_MIN, (cur + delta) | 0);
 
-      const ok = await this._pfSetRank(pfid, next);
-      if (ok) await this._pfMarkRankApplied(pfid, matchId, delta, next);
+        const ok = await this._pfSetRank(pfid, next);
+        if (ok) {
+          await this._pfMarkRankApplied(pfid, matchId, delta, next);
+        }
 
-      const cli = this.clients.find(x => x.sessionId === sid);
-      if (cli && ok) {
-        cli.send("rank_sync", { matchId, value: next, delta });
+        const cli = this.clients.find(x => x.sessionId === sid);
+        if (cli) {
+          // se ok -> manda next, altrimenti manda cur (così vedi che non è cambiato)
+          cli.send("rank_sync", { matchId, value: (ok ? next : cur) | 0, delta: ok ? delta : 0 });
+        }
+      } catch (e) {
+        console.error("[RANK] update error:", { pfid, sid, e });
       }
     }));
   }
