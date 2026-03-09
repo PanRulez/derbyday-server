@@ -61,7 +61,9 @@ class PlayerState extends Schema {
   @type("number") z: number = 0;
   @type("number") punti: number = 0;
   @type("string") nickname: string = "";
-  @type("number") skin_id: number = 0;
+
+  @type("number") mount_skin_id: number = 0;
+  @type("number") jockey_skin_id: number = 0;
 }
 
 class DerbyState extends Schema {
@@ -120,24 +122,45 @@ export class DerbyRoom extends Room<DerbyState> {
       this.lastActivity.set(client.sessionId, Date.now());
     });
 
-    this.onMessage("set_skin", (client, msg: { skin_id: number }) => {
+    this.onMessage("set_mount_skin", (client, msg: { skin_id: number }) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
 
         const skin = clamp((safeNum(msg?.skin_id, 0) | 0), 0, 23);
-        p.skin_id = skin;
+        p.mount_skin_id = skin;
 
-        this.broadcast("skin_update", {
+        this.broadcast("mount_skin_update", {
           sessionId: client.sessionId,
           numero_giocatore: p.numero_giocatore,
-          skin_id: p.skin_id
+          skin_id: p.mount_skin_id
         });
 
         this._markLeaderboardDirty();
       } catch (e) {
-        console.error("[set_skin] error:", e);
+        console.error("[set_mount_skin] error:", e);
+      }
+    });
+
+    this.onMessage("set_jockey_skin", (client, msg: { skin_id: number }) => {
+      try {
+        this.lastActivity.set(client.sessionId, Date.now());
+        const p = this.state.players.get(client.sessionId);
+        if (!p) return;
+
+        const skin = clamp((safeNum(msg?.skin_id, 0) | 0), 0, 23);
+        p.jockey_skin_id = skin;
+
+        this.broadcast("jockey_skin_update", {
+          sessionId: client.sessionId,
+          numero_giocatore: p.numero_giocatore,
+          skin_id: p.jockey_skin_id
+        });
+
+        this._markLeaderboardDirty();
+      } catch (e) {
+        console.error("[set_jockey_skin] error:", e);
       }
     });
 
@@ -363,7 +386,8 @@ export class DerbyRoom extends Room<DerbyState> {
       skins.push({
         sessionId: sid,
         numero_giocatore: ps.numero_giocatore,
-        skin_id: ps.skin_id ?? 0
+        mount_skin_id: ps.mount_skin_id ?? 0,
+        jockey_skin_id: ps.jockey_skin_id ?? 0
       });
     });
     client.send("skins_snapshot", skins);
@@ -585,7 +609,6 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  // ✅ QUI LOGGHIAMO il motivo se non aggiorna
   private async _pfSetRank(pfid: string, newValue: number): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
     try {
@@ -680,7 +703,6 @@ export class DerbyRoom extends Room<DerbyState> {
       try {
         const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
         if (already) {
-          // manda comunque sync al client (utile se UI non era aggiornata)
           const cur = await this._pfGetRank(pfid);
           const cli = this.clients.find(x => x.sessionId === sid);
           if (cli) cli.send("rank_sync", { matchId, value: cur | 0, delta: 0 });
@@ -697,7 +719,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
         const cli = this.clients.find(x => x.sessionId === sid);
         if (cli) {
-          // se ok -> manda next, altrimenti manda cur (così vedi che non è cambiato)
           cli.send("rank_sync", { matchId, value: (ok ? next : cur) | 0, delta: ok ? delta : 0 });
         }
       } catch (e) {
