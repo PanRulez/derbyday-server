@@ -41,14 +41,47 @@ const BOT_POS_UPDATES = true;
 const BOT_START_DELAY_MS = 4500;
 
 /* =========================
+   Bot cosmetics / names
+   ========================= */
+const BOT_MOUNT_SKINS_COUNT = 6;   // prime 6 skin cavalli
+const BOT_JOCKEY_SKINS_COUNT = 6;  // prime 6 skin fantini
+
+const BOT_NAMES = [
+  "Alberto",
+  "Matteo",
+  "Michele",
+  "Lisa",
+  "Ermes",
+  "Marco",
+  "Cristina",
+  "Monica",
+  "Alessandro",
+  "Lillo",
+];
+
+/* =========================
    Helpers
    ========================= */
 function safeNum(v: any, fallback = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
+
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
+}
+
+function randomInt(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function shuffleArray<T>(arr: T[]): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = randomInt(0, i);
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
 }
 
 /* =========================
@@ -766,14 +799,35 @@ export class DerbyRoom extends Room<DerbyState> {
     const used = new Set<number>();
     this.state.players.forEach(ps => used.add(ps.numero_giocatore));
 
+    const availableBotNames = shuffleArray(BOT_NAMES);
+
     for (let i = 1; i <= this.maxClients; i++) {
       if (!used.has(i)) {
         const sid = `BOT_${this.roomId}_${i}`;
         const ps = new PlayerState();
+
         ps.numero_giocatore = i;
-        ps.nickname = `BOT ${i}`;
+        ps.nickname = availableBotNames.length > 0 ? availableBotNames.shift()! : `BOT ${i}`;
+
+        // prime 6 skin
+        ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
+        ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
+
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
+
+        // broadcast immediato ai client già presenti
+        this.broadcast("mount_skin_update", {
+          sessionId: sid,
+          numero_giocatore: ps.numero_giocatore,
+          skin_id: ps.mount_skin_id
+        });
+
+        this.broadcast("jockey_skin_update", {
+          sessionId: sid,
+          numero_giocatore: ps.numero_giocatore,
+          skin_id: ps.jockey_skin_id
+        });
       }
     }
   }
