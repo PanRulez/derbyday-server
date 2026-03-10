@@ -43,8 +43,8 @@ const BOT_START_DELAY_MS = 4500;
 /* =========================
    Bot cosmetics / names
    ========================= */
-const BOT_MOUNT_SKINS_COUNT = 6;   // prime 6 skin cavalli
-const BOT_JOCKEY_SKINS_COUNT = 6;  // prime 6 skin fantini
+const BOT_MOUNT_SKINS_COUNT = 6;    // prime 6 skin cavalli
+const BOT_JOCKEY_SKINS_COUNT = 12;  // prime 12 skin fantini
 
 const BOT_NAMES = [
   "Alberto",
@@ -796,22 +796,55 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   private _spawnBotsIfNeeded() {
-    const used = new Set<number>();
-    this.state.players.forEach(ps => used.add(ps.numero_giocatore));
+    const usedNumbers = new Set<number>();
+    this.state.players.forEach(ps => usedNumbers.add(ps.numero_giocatore));
 
     const availableBotNames = shuffleArray(BOT_NAMES);
 
+    // Skin jockey già usate dai player umani, ma solo entro le prime 12
+    const usedHumanJockeySkins = new Set<number>();
+    this.state.players.forEach((ps, sid) => {
+      if (!sid.startsWith("BOT_")) {
+        const skin = safeNum(ps.jockey_skin_id, -1) | 0;
+        if (skin >= 0 && skin < BOT_JOCKEY_SKINS_COUNT) {
+          usedHumanJockeySkins.add(skin);
+        }
+      }
+    });
+
+    // Pool disponibile per i bot: 0..11 escluse quelle già usate dai player umani
+    const availableBotJockeySkins: number[] = [];
+    for (let i = 0; i < BOT_JOCKEY_SKINS_COUNT; i++) {
+      if (!usedHumanJockeySkins.has(i)) {
+        availableBotJockeySkins.push(i);
+      }
+    }
+
+    // Mischiamo il pool per non assegnare sempre gli stessi id
+    const shuffledJockeyPool = shuffleArray(availableBotJockeySkins);
+
     for (let i = 1; i <= this.maxClients; i++) {
-      if (!used.has(i)) {
+      if (!usedNumbers.has(i)) {
         const sid = `BOT_${this.roomId}_${i}`;
         const ps = new PlayerState();
 
         ps.numero_giocatore = i;
         ps.nickname = availableBotNames.length > 0 ? availableBotNames.shift()! : `BOT ${i}`;
 
-        // prime 6 skin
+        // mount skin: come prima
         ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
-        ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
+
+        // jockey skin:
+        // - entro le prime 12
+        // - diversa dalle skin dei player umani
+        // - diversa anche dagli altri bot della stessa partita
+        if (shuffledJockeyPool.length > 0) {
+          ps.jockey_skin_id = shuffledJockeyPool.shift()!;
+        } else {
+          // fallback estremo: se finiscono tutte le skin libere
+          // ne assegna una casuale entro le prime 12
+          ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
+        }
 
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
