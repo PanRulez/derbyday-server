@@ -43,8 +43,8 @@ const BOT_START_DELAY_MS = 4500;
 /* =========================
    Bot cosmetics / names
    ========================= */
-const BOT_MOUNT_SKINS_COUNT = 6;    // prime 6 skin cavalli
-const BOT_JOCKEY_SKINS_COUNT = 12;  // prime 12 skin fantini
+const BOT_MOUNT_SKINS_COUNT = 6;
+const BOT_JOCKEY_SKINS_COUNT = 12;
 
 const BOT_NAMES = [
   "Alberto",
@@ -58,6 +58,13 @@ const BOT_NAMES = [
   "Alessandro",
   "Lillo",
 ];
+
+/* =========================
+   Badge offsets
+   ========================= */
+const AVATAR_ID_OFFSET = 4000;
+const AVATAR_BG_ID_OFFSET = 5000;
+const PLATE_ID_OFFSET = 6000;
 
 /* =========================
    Helpers
@@ -97,6 +104,11 @@ class PlayerState extends Schema {
 
   @type("number") mount_skin_id: number = 0;
   @type("number") jockey_skin_id: number = 0;
+
+  // badge cosmetics (solo per fine gara)
+  @type("number") avatar_id: number = AVATAR_ID_OFFSET;
+  @type("number") avatar_bg_id: number = AVATAR_BG_ID_OFFSET;
+  @type("number") plate_id: number = PLATE_ID_OFFSET;
 }
 
 class DerbyState extends Schema {
@@ -131,14 +143,12 @@ export class DerbyRoom extends Room<DerbyState> {
   private lastActivity = new Map<string, number>();
   private readonly INACTIVITY_TIMEOUT = 60000;
 
-  // ✅ CO guadagnati in questa partita (somma buche 1/2/4)
-  private matchEarnedCO = new Map<string, number>(); // sid -> earned
+  private matchEarnedCO = new Map<string, number>();
 
   onCreate() {
     this.setState(new DerbyState());
     this.autoDispose = true;
 
-    // kick inattivi
     this.clock.setInterval(() => {
       const now = Date.now();
       this.clients.forEach(client => {
@@ -197,6 +207,20 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
+    this.onMessage("set_badge_cosmetics", (client, msg: { avatar_id: number; avatar_bg_id: number; plate_id: number }) => {
+      try {
+        this.lastActivity.set(client.sessionId, Date.now());
+        const p = this.state.players.get(client.sessionId);
+        if (!p) return;
+
+        p.avatar_id = Math.max(AVATAR_ID_OFFSET, safeNum(msg?.avatar_id, AVATAR_ID_OFFSET) | 0);
+        p.avatar_bg_id = Math.max(AVATAR_BG_ID_OFFSET, safeNum(msg?.avatar_bg_id, AVATAR_BG_ID_OFFSET) | 0);
+        p.plate_id = Math.max(PLATE_ID_OFFSET, safeNum(msg?.plate_id, PLATE_ID_OFFSET) | 0);
+      } catch (e) {
+        console.error("[set_badge_cosmetics] error:", e);
+      }
+    });
+
     this.onMessage("posizione", (client, msg: { x: number; y: number; z: number }) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
@@ -227,11 +251,6 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
-    /**
-     * ✅ client manda: "totale punti"
-     * ✅ server accetta solo +0..4 per update (1/2/4)
-     * ✅ CO partita = delta
-     */
     this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
@@ -356,7 +375,6 @@ export class DerbyRoom extends Room<DerbyState> {
     this._spawnBotsIfNeeded();
     this.matchId = `${this.roomId}-${Date.now()}`;
 
-    // reset CO match
     this.matchEarnedCO.clear();
 
     this.broadcast("match_started", { matchId: this.matchId });
@@ -392,7 +410,6 @@ export class DerbyRoom extends Room<DerbyState> {
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
 
-      // saldo
       this._pfGetBalances(pfid)
         .then(vc => {
           if (vc) client.send("wallet_sync", {
@@ -403,7 +420,6 @@ export class DerbyRoom extends Room<DerbyState> {
         })
         .catch(err => console.error("[_pfGetBalances] error:", err));
 
-      // ✅ rank sync immediato (delta=0)
       this._pfGetRank(pfid)
         .then(curRank => {
           client.send("rank_sync", { matchId: "", value: (curRank ?? 0) | 0, delta: 0 });
@@ -413,7 +429,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     client.send("numero_giocatore", numero);
 
-    // skins snapshot
     const skins: any[] = [];
     this.state.players.forEach((ps, sid) => {
       skins.push({
@@ -467,6 +482,43 @@ export class DerbyRoom extends Room<DerbyState> {
     return (ps?.nickname ?? "").toString().slice(0, 24);
   }
 
+  private async _buildWinnerBadgePayload(winnerSid: string) {
+    const ps = this.state.players.get(winnerSid);
+
+    if (!ps) {
+      return {
+        winner_avatar_id: AVATAR_ID_OFFSET,
+        winner_avatar_bg_id: AVATAR_BG_ID_OFFSET,
+        winner_plate_id: PLATE_ID_OFFSET,
+        winner_rank: 0,
+      };
+    }
+
+    // BOT
+    if (winnerSid.startsWith("BOT_")) {
+      return {
+        winner_avatar_id: AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0),
+        winner_avatar_bg_id: AVATAR_BG_ID_OFFSET,
+        winner_plate_id: PLATE_ID_OFFSET,
+        winner_rank: 0,
+      };
+    }
+
+    // HUMAN
+    let rank = 0;
+    const pfid = this.sid2pf.get(winnerSid);
+    if (pfid) {
+      rank = await this._pfGetRank(pfid);
+    }
+
+    return {
+      winner_avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
+      winner_avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
+      winner_plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+      winner_rank: rank | 0,
+    };
+  }
+
   private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
     if (this.matchTerminato) return;
 
@@ -476,6 +528,7 @@ export class DerbyRoom extends Room<DerbyState> {
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
     const finalBoard = this._buildLeaderboardPayload();
     const winnerNick = this._getNicknameBySid(winnerSid);
+    const winnerBadge = await this._buildWinnerBadgePayload(winnerSid);
 
     this.broadcast("gara_finita", {
       matchId,
@@ -484,10 +537,10 @@ export class DerbyRoom extends Room<DerbyState> {
       winner_points: this.puntiVittoria,
       winner_nick: winnerNick,
       tempo,
-      classifica: finalBoard
+      classifica: finalBoard,
+      ...winnerBadge
     });
 
-    // ====== CO payout (buche) ======
     try {
       await Promise.all(this.clients.map(async (cli) => {
         const sid = cli.sessionId;
@@ -515,7 +568,6 @@ export class DerbyRoom extends Room<DerbyState> {
       console.error("[CO] payout error:", e);
     }
 
-    // ====== RANK payout ======
     try {
       await this._pfApplyRankAfterMatch(matchId, winnerSid);
     } catch (e) {
@@ -801,7 +853,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     const availableBotNames = shuffleArray(BOT_NAMES);
 
-    // Skin jockey già usate dai player umani, ma solo entro le prime 12
     const usedHumanJockeySkins = new Set<number>();
     this.state.players.forEach((ps, sid) => {
       if (!sid.startsWith("BOT_")) {
@@ -812,7 +863,6 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
-    // Pool disponibile per i bot: 0..11 escluse quelle già usate dai player umani
     const availableBotJockeySkins: number[] = [];
     for (let i = 0; i < BOT_JOCKEY_SKINS_COUNT; i++) {
       if (!usedHumanJockeySkins.has(i)) {
@@ -820,7 +870,6 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     }
 
-    // Mischiamo il pool per non assegnare sempre gli stessi id
     const shuffledJockeyPool = shuffleArray(availableBotJockeySkins);
 
     for (let i = 1; i <= this.maxClients; i++) {
@@ -831,25 +880,22 @@ export class DerbyRoom extends Room<DerbyState> {
         ps.numero_giocatore = i;
         ps.nickname = availableBotNames.length > 0 ? availableBotNames.shift()! : `BOT ${i}`;
 
-        // mount skin: come prima
         ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
 
-        // jockey skin:
-        // - entro le prime 12
-        // - diversa dalle skin dei player umani
-        // - diversa anche dagli altri bot della stessa partita
         if (shuffledJockeyPool.length > 0) {
           ps.jockey_skin_id = shuffledJockeyPool.shift()!;
         } else {
-          // fallback estremo: se finiscono tutte le skin libere
-          // ne assegna una casuale entro le prime 12
           ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
         }
+
+        // badge bot
+        ps.avatar_id = AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0);
+        ps.avatar_bg_id = AVATAR_BG_ID_OFFSET;
+        ps.plate_id = PLATE_ID_OFFSET;
 
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
 
-        // broadcast immediato ai client già presenti
         this.broadcast("mount_skin_update", {
           sessionId: sid,
           numero_giocatore: ps.numero_giocatore,
