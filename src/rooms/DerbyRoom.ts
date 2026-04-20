@@ -116,7 +116,11 @@ class DerbyState extends Schema {
   @type({ map: PlayerState }) players = new MapSchema<PlayerState>();
 }
 
-type BotInfo = { sid: string; numero: number; timer?: NodeJS.Timeout };
+type BotInfo = {
+  sid: string;
+  numero: number;
+  timer?: NodeJS.Timeout;
+};
 
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
@@ -146,7 +150,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
   private matchEarnedCO = new Map<string, number>();
 
-  onCreate() {
+  onCreate(): void {
     this.setState(new DerbyState());
     this.autoDispose = true;
 
@@ -169,6 +173,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this.onMessage("set_mount_skin", (client, msg: { skin_id: number }) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
+
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
 
@@ -190,6 +195,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this.onMessage("set_jockey_skin", (client, msg: { skin_id: number }) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
+
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
 
@@ -210,16 +216,37 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.onMessage(
       "set_badge_cosmetics",
-      (client, msg: { avatar_id: number; avatar_bg_id: number; plate_id: number; frame_id: number }) => {
+      (
+        client,
+        msg: {
+          avatar_id: number;
+          avatar_bg_id: number;
+          plate_id: number;
+          frame_id: number;
+        }
+      ) => {
         try {
           this.lastActivity.set(client.sessionId, Date.now());
+
           const p = this.state.players.get(client.sessionId);
           if (!p) return;
 
-          p.avatar_id = Math.max(AVATAR_ID_OFFSET, safeNum(msg?.avatar_id, AVATAR_ID_OFFSET) | 0);
-          p.avatar_bg_id = Math.max(AVATAR_BG_ID_OFFSET, safeNum(msg?.avatar_bg_id, AVATAR_BG_ID_OFFSET) | 0);
-          p.plate_id = Math.max(PLATE_ID_OFFSET, safeNum(msg?.plate_id, PLATE_ID_OFFSET) | 0);
-          p.frame_id = Math.max(FRAME_ID_OFFSET, safeNum(msg?.frame_id, FRAME_ID_OFFSET) | 0);
+          p.avatar_id = Math.max(
+            AVATAR_ID_OFFSET,
+            safeNum(msg?.avatar_id, AVATAR_ID_OFFSET) | 0
+          );
+          p.avatar_bg_id = Math.max(
+            AVATAR_BG_ID_OFFSET,
+            safeNum(msg?.avatar_bg_id, AVATAR_BG_ID_OFFSET) | 0
+          );
+          p.plate_id = Math.max(
+            PLATE_ID_OFFSET,
+            safeNum(msg?.plate_id, PLATE_ID_OFFSET) | 0
+          );
+          p.frame_id = Math.max(
+            FRAME_ID_OFFSET,
+            safeNum(msg?.frame_id, FRAME_ID_OFFSET) | 0
+          );
         } catch (e) {
           console.error("[set_badge_cosmetics] error:", e);
         }
@@ -246,7 +273,13 @@ export class DerbyRoom extends Room<DerbyState> {
 
         this.broadcast(
           "pos_update",
-          { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, x: p.x, y: p.y, z: p.z },
+          {
+            sessionId: client.sessionId,
+            numero_giocatore: p.numero_giocatore,
+            x: p.x,
+            y: p.y,
+            z: p.z,
+          },
           { except: client }
         );
 
@@ -265,7 +298,10 @@ export class DerbyRoom extends Room<DerbyState> {
         if (!p) return;
 
         const old = p.punti;
-        const requested = Math.min(Math.max((nuovi_punti | 0), 0), this.puntiVittoria);
+        const requested = Math.min(
+          Math.max((nuovi_punti | 0), 0),
+          this.puntiVittoria
+        );
 
         let delta = (requested - old) | 0;
         delta = clamp(delta, 0, 4);
@@ -307,7 +343,9 @@ export class DerbyRoom extends Room<DerbyState> {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
         const p = this.state.players.get(client.sessionId);
-        if (p) p.nickname = (nick ?? "").toString().slice(0, 24);
+        if (p) {
+          p.nickname = (nick ?? "").toString().slice(0, 24);
+        }
         this._markLeaderboardDirty();
       } catch (e) {
         console.error("[set_nickname] error:", e);
@@ -341,7 +379,14 @@ export class DerbyRoom extends Room<DerbyState> {
 
         this.broadcast(
           "lancio_update",
-          { sessionId: client.sessionId, numero_giocatore: p.numero_giocatore, fx: fxC, fz: fzC, x, z },
+          {
+            sessionId: client.sessionId,
+            numero_giocatore: p.numero_giocatore,
+            fx: fxC,
+            fz: fzC,
+            x,
+            z,
+          },
           { except: client }
         );
       } catch (e) {
@@ -353,7 +398,7 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Countdown / Start
      ========================= */
-  private _tryStartCountdown(_reason: string) {
+  private _tryStartCountdown(_reason: string): void {
     if (this.countdownStarted || this.matchLanciato || this.matchTerminato) return;
     if (this.clients.length < this.minimoGiocatori) return;
 
@@ -364,13 +409,17 @@ export class DerbyRoom extends Room<DerbyState> {
     this.interval = setInterval(() => {
       this.tempoRimanente -= 1;
       this.broadcast("countdown_update", Math.max(0, this.tempoRimanente));
-      if (this.tempoRimanente <= 0 || this.state.players.size >= this.maxClients) {
+
+      if (
+        this.tempoRimanente <= 0 ||
+        this.state.players.size >= this.maxClients
+      ) {
         this.lanciaMatch();
       }
     }, 1000);
   }
 
-  private lanciaMatch() {
+  private lanciaMatch(): void {
     if (this.matchLanciato || this.matchTerminato) return;
 
     this.matchLanciato = true;
@@ -392,14 +441,16 @@ export class DerbyRoom extends Room<DerbyState> {
     this._startLeaderboardTicker(300);
 
     setTimeout(() => {
-      if (!this.matchTerminato) this._runBots();
+      if (!this.matchTerminato) {
+        this._runBots();
+      }
     }, BOT_START_DELAY_MS);
   }
 
   /* =========================
      Join / Leave
      ========================= */
-  onJoin(client: Client, options: any) {
+  onJoin(client: Client, options: any): void {
     this.lastActivity.set(client.sessionId, Date.now());
 
     if (this.matchTerminato || this.matchLanciato) {
@@ -433,7 +484,11 @@ export class DerbyRoom extends Room<DerbyState> {
 
       this._pfGetRank(pfid)
         .then((curRank) => {
-          client.send("rank_sync", { matchId: "", value: (curRank ?? 0) | 0, delta: 0 });
+          client.send("rank_sync", {
+            matchId: "",
+            value: (curRank ?? 0) | 0,
+            delta: 0,
+          });
         })
         .catch((err) => console.error("[_pfGetRank][onJoin] error:", err));
     }
@@ -462,7 +517,7 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  onLeave(client: Client) {
+  onLeave(client: Client): void {
     try {
       this.lastActivity.delete(client.sessionId);
       this.lastPosTs.delete(client.sessionId);
@@ -485,7 +540,7 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  onDispose() {
+  onDispose(): void {
     this._clearAllTimers();
   }
 
@@ -497,7 +552,15 @@ export class DerbyRoom extends Room<DerbyState> {
     return (ps?.nickname ?? "").toString().slice(0, 24);
   }
 
-  private async _buildWinnerBadgePayload(winnerSid: string) {
+  private async _buildWinnerBadgePayload(
+    winnerSid: string
+  ): Promise<{
+    winner_avatar_id: number;
+    winner_avatar_bg_id: number;
+    winner_plate_id: number;
+    winner_frame_id: number;
+    winner_rank: number;
+  }> {
     const ps = this.state.players.get(winnerSid);
 
     if (!ps) {
@@ -535,7 +598,11 @@ export class DerbyRoom extends Room<DerbyState> {
     };
   }
 
-  private async _fineGara(winnerSid: string, numero: number, tempo: number | null) {
+  private async _fineGara(
+    winnerSid: string,
+    numero: number,
+    tempo: number | null
+  ): Promise<void> {
     if (this.matchTerminato) return;
 
     this.matchTerminato = true;
@@ -578,7 +645,11 @@ export class DerbyRoom extends Room<DerbyState> {
               delta: earned,
               matchId,
             });
-            cli.send("coins_awarded", { matchId, delta: earned });
+
+            cli.send("coins_awarded", {
+              matchId,
+              delta: earned,
+            });
           }
         })
       );
@@ -598,11 +669,13 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Bots
      ========================= */
-  private _runBots() {
+  private _runBots(): void {
     const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
 
     for (const bot of this.bots) {
-      const baseMs = BOT_BASE_MS_MIN + Math.floor(Math.random() * (BOT_BASE_MS_MAX - BOT_BASE_MS_MIN));
+      const baseMs =
+        BOT_BASE_MS_MIN +
+        Math.floor(Math.random() * (BOT_BASE_MS_MAX - BOT_BASE_MS_MIN));
 
       const tick = () => {
         if (this.matchTerminato) return;
@@ -612,6 +685,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
         let r = Math.floor(Math.random() * totalW);
         let pick = 1;
+
         for (const k of BOT_WEIGHTS) {
           if (r < k.w) {
             pick = k.s;
@@ -654,7 +728,7 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Timers cleanup
      ========================= */
-  private _clearAllTimers() {
+  private _clearAllTimers(): void {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
@@ -666,7 +740,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     this.bots.forEach((b) => {
-      if (b.timer) clearInterval(b.timer);
+      if (b.timer) {
+        clearInterval(b.timer);
+      }
       b.timer = undefined;
     });
   }
@@ -674,26 +750,42 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      PlayFab helpers
      ========================= */
-  private async _pfAddCurrency(pfid: string, code: string, amount: number) {
+  private async _pfAddCurrency(
+    pfid: string,
+    code: string,
+    amount: number
+  ): Promise<any | null> {
     if (!PF_HOST || !PF_SECRET) return null;
 
     const res = await fetch(`${PF_HOST}/Server/AddUserVirtualCurrency`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-      body: JSON.stringify({ PlayFabId: pfid, VirtualCurrency: code, Amount: amount }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-SecretKey": PF_SECRET,
+      },
+      body: JSON.stringify({
+        PlayFabId: pfid,
+        VirtualCurrency: code,
+        Amount: amount,
+      }),
     });
 
     const json = await res.json().catch(() => null);
     return json?.code === 200 ? this._pfGetBalances(pfid) : null;
   }
 
-  private async _pfGetBalances(pfid: string) {
+  private async _pfGetBalances(pfid: string): Promise<any | null> {
     if (!PF_HOST || !PF_SECRET) return null;
 
     const res = await fetch(`${PF_HOST}/Server/GetUserInventory`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-      body: JSON.stringify({ PlayFabId: pfid }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-SecretKey": PF_SECRET,
+      },
+      body: JSON.stringify({
+        PlayFabId: pfid,
+      }),
     });
 
     const json = await res.json().catch(() => null);
@@ -702,13 +794,22 @@ export class DerbyRoom extends Room<DerbyState> {
 
   private async _pfGetRank(pfid: string): Promise<number> {
     if (!PF_HOST || !PF_SECRET) return 0;
+
     try {
       const res = await fetch(`${PF_HOST}/Server/GetPlayerStatistics`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-        body: JSON.stringify({ PlayFabId: pfid, StatisticNames: [RANK_STAT] }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-SecretKey": PF_SECRET,
+        },
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          StatisticNames: [RANK_STAT],
+        }),
       });
+
       const json = await res.json().catch(() => null);
+
       if (json?.code !== 200) {
         console.error("[PF][getRank] FAILED:", {
           http: res.status,
@@ -719,24 +820,40 @@ export class DerbyRoom extends Room<DerbyState> {
         });
         return 0;
       }
+
       const stats = json?.data?.Statistics ?? [];
       const found = stats.find((s: any) => s?.StatisticName === RANK_STAT);
-      return found && Number.isFinite(Number(found.Value)) ? Number(found.Value) : 0;
+
+      return found && Number.isFinite(Number(found.Value))
+        ? Number(found.Value)
+        : 0;
     } catch (e) {
       console.error("[PF][getRank] error:", e);
       return 0;
     }
   }
 
-  private async _pfSetRank(pfid: string, newValue: number): Promise<boolean> {
+  private async _pfSetRank(
+    pfid: string,
+    newValue: number
+  ): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
+
     try {
       const res = await fetch(`${PF_HOST}/Server/UpdatePlayerStatistics`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        headers: {
+          "Content-Type": "application/json",
+          "X-SecretKey": PF_SECRET,
+        },
         body: JSON.stringify({
           PlayFabId: pfid,
-          Statistics: [{ StatisticName: RANK_STAT, Value: newValue | 0 }],
+          Statistics: [
+            {
+              StatisticName: RANK_STAT,
+              Value: newValue | 0,
+            },
+          ],
         }),
       });
 
@@ -761,16 +878,28 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  private async _pfWasRankAlreadyApplied(pfid: string, matchId: string): Promise<boolean> {
+  private async _pfWasRankAlreadyApplied(
+    pfid: string,
+    matchId: string
+  ): Promise<boolean> {
     if (!PF_HOST || !PF_SECRET) return false;
+
     try {
       const res = await fetch(`${PF_HOST}/Server/GetUserReadOnlyData`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
-        body: JSON.stringify({ PlayFabId: pfid, Keys: ["rank_last_match_id"] }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-SecretKey": PF_SECRET,
+        },
+        body: JSON.stringify({
+          PlayFabId: pfid,
+          Keys: ["rank_last_match_id"],
+        }),
       });
+
       const json = await res.json().catch(() => null);
       if (json?.code !== 200) return false;
+
       const last = json?.data?.Data?.rank_last_match_id?.Value ?? "";
       return String(last) === String(matchId);
     } catch (e) {
@@ -779,12 +908,21 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  private async _pfMarkRankApplied(pfid: string, matchId: string, delta: number, value: number): Promise<void> {
+  private async _pfMarkRankApplied(
+    pfid: string,
+    matchId: string,
+    delta: number,
+    value: number
+  ): Promise<void> {
     if (!PF_HOST || !PF_SECRET) return;
+
     try {
       await fetch(`${PF_HOST}/Server/UpdateUserReadOnlyData`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        headers: {
+          "Content-Type": "application/json",
+          "X-SecretKey": PF_SECRET,
+        },
         body: JSON.stringify({
           PlayFabId: pfid,
           Data: {
@@ -799,16 +937,22 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  private async _pfApplyRankAfterMatch(matchId: string, winnerSid: string) {
+  private async _pfApplyRankAfterMatch(
+    matchId: string,
+    winnerSid: string
+  ): Promise<void> {
     if (!PF_HOST || !PF_SECRET) {
       console.error("[RANK] PF env missing (PF_HOST/PF_SECRET).");
       return;
     }
 
     const entries: Array<{ sid: string; pfid: string }> = [];
+
     for (const c of this.clients) {
       const pfid = this.sid2pf.get(c.sessionId);
-      if (pfid) entries.push({ sid: c.sessionId, pfid });
+      if (pfid) {
+        entries.push({ sid: c.sessionId, pfid });
+      }
     }
 
     if (entries.length === 0) {
@@ -825,7 +969,13 @@ export class DerbyRoom extends Room<DerbyState> {
           if (already) {
             const cur = await this._pfGetRank(pfid);
             const cli = this.clients.find((x) => x.sessionId === sid);
-            if (cli) cli.send("rank_sync", { matchId, value: cur | 0, delta: 0 });
+            if (cli) {
+              cli.send("rank_sync", {
+                matchId,
+                value: cur | 0,
+                delta: 0,
+              });
+            }
             return;
           }
 
@@ -855,21 +1005,23 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Leaderboard helpers
      ========================= */
-  private _buildLeaderboardPayload() {
+  private _buildLeaderboardPayload(): any[] {
     const list: any[] = [];
-    this.state.players.forEach((ps, sid) =>
+
+    this.state.players.forEach((ps, sid) => {
       list.push({
         sessionId: sid,
         numero_giocatore: ps.numero_giocatore,
         nickname: ps.nickname,
         punti: ps.punti,
         x: ps.x,
-      })
-    );
+      });
+    });
+
     return list.sort((a, b) => b.punti - a.punti || b.x - a.x);
   }
 
-  private _startLeaderboardTicker(ms: number) {
+  private _startLeaderboardTicker(ms: number): void {
     if (this.leaderboardTimer) {
       clearInterval(this.leaderboardTimer);
       this.leaderboardTimer = null;
@@ -883,20 +1035,25 @@ export class DerbyRoom extends Room<DerbyState> {
     }, ms);
   }
 
-  private _markLeaderboardDirty() {
+  private _markLeaderboardDirty(): void {
     this.leaderboardDirty = true;
   }
 
   private _assignNumeroGiocatore(): number {
     const used = new Set<number>();
-    this.state.players.forEach((ps) => used.add(ps.numero_giocatore));
+
+    this.state.players.forEach((ps) => {
+      used.add(ps.numero_giocatore);
+    });
+
     for (let i = 1; i <= this.maxClients; i++) {
       if (!used.has(i)) return i;
     }
+
     return 1;
   }
 
-  private _spawnBotsIfNeeded() {
+  private _spawnBotsIfNeeded(): void {
     const usedNumbers = new Set<number>();
     this.state.players.forEach((ps) => usedNumbers.add(ps.numero_giocatore));
 
@@ -922,41 +1079,44 @@ export class DerbyRoom extends Room<DerbyState> {
     const shuffledJockeyPool = shuffleArray(availableBotJockeySkins);
 
     for (let i = 1; i <= this.maxClients; i++) {
-      if (!usedNumbers.has(i)) {
-        const sid = `BOT_${this.roomId}_${i}`;
-        const ps = new PlayerState();
+      if (usedNumbers.has(i)) continue;
 
-        ps.numero_giocatore = i;
-        ps.nickname = availableBotNames.length > 0 ? availableBotNames.shift()! : `BOT ${i}`;
+      const sid = `BOT_${this.roomId}_${i}`;
+      const ps = new PlayerState();
 
-        ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
+      ps.numero_giocatore = i;
+      ps.nickname =
+        availableBotNames.length > 0
+          ? availableBotNames.shift()!
+          : `BOT ${i}`;
 
-        if (shuffledJockeyPool.length > 0) {
-          ps.jockey_skin_id = shuffledJockeyPool.shift()!;
-        } else {
-          ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
-        }
+      ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
 
-        ps.avatar_id = AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0);
-        ps.avatar_bg_id = AVATAR_BG_ID_OFFSET;
-        ps.plate_id = PLATE_ID_OFFSET;
-        ps.frame_id = FRAME_ID_OFFSET;
-
-        this.state.players.set(sid, ps);
-        this.bots.push({ sid, numero: i });
-
-        this.broadcast("mount_skin_update", {
-          sessionId: sid,
-          numero_giocatore: ps.numero_giocatore,
-          skin_id: ps.mount_skin_id,
-        });
-
-        this.broadcast("jockey_skin_update", {
-          sessionId: sid,
-          numero_giocatore: ps.numero_giocatore,
-          skin_id: ps.jockey_skin_id,
-        });
+      if (shuffledJockeyPool.length > 0) {
+        ps.jockey_skin_id = shuffledJockeyPool.shift()!;
+      } else {
+        ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
       }
+
+      ps.avatar_id = AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0);
+      ps.avatar_bg_id = AVATAR_BG_ID_OFFSET;
+      ps.plate_id = PLATE_ID_OFFSET;
+      ps.frame_id = FRAME_ID_OFFSET;
+
+      this.state.players.set(sid, ps);
+      this.bots.push({ sid, numero: i });
+
+      this.broadcast("mount_skin_update", {
+        sessionId: sid,
+        numero_giocatore: ps.numero_giocatore,
+        skin_id: ps.mount_skin_id,
+      });
+
+      this.broadcast("jockey_skin_update", {
+        sessionId: sid,
+        numero_giocatore: ps.numero_giocatore,
+        skin_id: ps.jockey_skin_id,
+      });
     }
   }
 }
