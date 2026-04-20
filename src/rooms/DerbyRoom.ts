@@ -65,6 +65,7 @@ const BOT_NAMES = [
 const AVATAR_ID_OFFSET = 4000;
 const AVATAR_BG_ID_OFFSET = 5000;
 const PLATE_ID_OFFSET = 6000;
+const FRAME_ID_OFFSET = 7000;
 
 /* =========================
    Helpers
@@ -108,6 +109,7 @@ class PlayerState extends Schema {
   @type("number") avatar_id: number = AVATAR_ID_OFFSET;
   @type("number") avatar_bg_id: number = AVATAR_BG_ID_OFFSET;
   @type("number") plate_id: number = PLATE_ID_OFFSET;
+  @type("number") frame_id: number = FRAME_ID_OFFSET;
 }
 
 class DerbyState extends Schema {
@@ -208,7 +210,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.onMessage(
       "set_badge_cosmetics",
-      (client, msg: { avatar_id: number; avatar_bg_id: number; plate_id: number }) => {
+      (client, msg: { avatar_id: number; avatar_bg_id: number; plate_id: number; frame_id: number }) => {
         try {
           this.lastActivity.set(client.sessionId, Date.now());
           const p = this.state.players.get(client.sessionId);
@@ -217,6 +219,7 @@ export class DerbyRoom extends Room<DerbyState> {
           p.avatar_id = Math.max(AVATAR_ID_OFFSET, safeNum(msg?.avatar_id, AVATAR_ID_OFFSET) | 0);
           p.avatar_bg_id = Math.max(AVATAR_BG_ID_OFFSET, safeNum(msg?.avatar_bg_id, AVATAR_BG_ID_OFFSET) | 0);
           p.plate_id = Math.max(PLATE_ID_OFFSET, safeNum(msg?.plate_id, PLATE_ID_OFFSET) | 0);
+          p.frame_id = Math.max(FRAME_ID_OFFSET, safeNum(msg?.frame_id, FRAME_ID_OFFSET) | 0);
         } catch (e) {
           console.error("[set_badge_cosmetics] error:", e);
         }
@@ -447,6 +450,7 @@ export class DerbyRoom extends Room<DerbyState> {
         avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
         avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
         plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+        frame_id: ps.frame_id ?? FRAME_ID_OFFSET,
       });
     });
     client.send("skins_snapshot", skins);
@@ -501,6 +505,7 @@ export class DerbyRoom extends Room<DerbyState> {
         winner_avatar_id: AVATAR_ID_OFFSET,
         winner_avatar_bg_id: AVATAR_BG_ID_OFFSET,
         winner_plate_id: PLATE_ID_OFFSET,
+        winner_frame_id: FRAME_ID_OFFSET,
         winner_rank: 0,
       };
     }
@@ -510,6 +515,7 @@ export class DerbyRoom extends Room<DerbyState> {
         winner_avatar_id: AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0),
         winner_avatar_bg_id: AVATAR_BG_ID_OFFSET,
         winner_plate_id: PLATE_ID_OFFSET,
+        winner_frame_id: FRAME_ID_OFFSET,
         winner_rank: 0,
       };
     }
@@ -524,6 +530,7 @@ export class DerbyRoom extends Room<DerbyState> {
       winner_avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       winner_avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
       winner_plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+      winner_frame_id: ps.frame_id ?? FRAME_ID_OFFSET,
       winner_rank: rank | 0,
     };
   }
@@ -933,6 +940,7 @@ export class DerbyRoom extends Room<DerbyState> {
         ps.avatar_id = AVATAR_ID_OFFSET + (ps.jockey_skin_id | 0);
         ps.avatar_bg_id = AVATAR_BG_ID_OFFSET;
         ps.plate_id = PLATE_ID_OFFSET;
+        ps.frame_id = FRAME_ID_OFFSET;
 
         this.state.players.set(sid, ps);
         this.bots.push({ sid, numero: i });
