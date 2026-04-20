@@ -289,7 +289,9 @@ export class DerbyRoom extends Room<DerbyState> {
       }
     });
 
-    this.onMessage("aggiorna_punti", (client, nuovi_punti: number) => {
+    // IMPORTANTE:
+    // qui il payload è interpretato come punti della singola buca: 1 / 2 / 4
+    this.onMessage("aggiorna_punti", (client, punti_buca: number) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
         if (this.matchTerminato || !this.matchLanciato) return;
@@ -298,22 +300,22 @@ export class DerbyRoom extends Room<DerbyState> {
         if (!p) return;
 
         const old = p.punti;
-        const requested = Math.min(
-          Math.max((nuovi_punti | 0), 0),
-          this.puntiVittoria
-        );
 
-        let delta = (requested - old) | 0;
+        let delta = safeNum(punti_buca, 0) | 0;
         delta = clamp(delta, 0, 4);
+
+        if (delta <= 0) return;
 
         const target = Math.min(old + delta, this.puntiVittoria);
         if (target === old) return;
+
+        const appliedDelta = target - old;
 
         p.punti = target;
         p.x = TRACK_X_START + STEP_X * p.punti;
 
         const prevCO = this.matchEarnedCO.get(client.sessionId) ?? 0;
-        this.matchEarnedCO.set(client.sessionId, prevCO + delta);
+        this.matchEarnedCO.set(client.sessionId, prevCO + appliedDelta);
 
         this.broadcast("punteggio_aggiornato", {
           sessionId: client.sessionId,
