@@ -43,7 +43,7 @@ const BOT_START_DELAY_MS = 4500;
 /* =========================
    Bot cosmetics / names
    ========================= */
-const BOT_MOUNT_SKINS_COUNT = 6;
+const BOT_MOUNT_SKINS_COUNT = 12;
 const BOT_JOCKEY_SKINS_COUNT = 6;
 
 const BOT_NAMES = [
@@ -122,6 +122,16 @@ type BotInfo = {
   timer?: NodeJS.Timeout;
 };
 
+type FinishEntry = {
+  sid: string;
+  numero: number;
+  position: number;
+  nickname: string;
+  punti: number;
+  x: number;
+  isBot: boolean;
+};
+
 export class DerbyRoom extends Room<DerbyState> {
   maxClients = 6;
 
@@ -139,6 +149,7 @@ export class DerbyRoom extends Room<DerbyState> {
   leaderboardDirty = false;
 
   bots: BotInfo[] = [];
+  finishedOrder: FinishEntry[] = [];
   matchId: string | null = null;
 
   private sid2pf = new Map<string, string>();
@@ -334,7 +345,7 @@ export class DerbyRoom extends Room<DerbyState> {
         this._markLeaderboardDirty();
 
         if (p.punti >= this.puntiVittoria && old < this.puntiVittoria) {
-          this._fineGara(client.sessionId, p.numero_giocatore, null);
+          this._registerFinish(client.sessionId);
         }
       } catch (e) {
         console.error("[aggiorna_punti] error:", e);
@@ -436,6 +447,7 @@ export class DerbyRoom extends Room<DerbyState> {
     this._spawnBotsIfNeeded();
     this.matchId = `${this.roomId}-${Date.now()}`;
     this.matchEarnedCO.clear();
+    this.finishedOrder = [];
 
     this.broadcast("match_started", { matchId: this.matchId });
     this.broadcast("inizia_match");
@@ -554,6 +566,63 @@ export class DerbyRoom extends Room<DerbyState> {
     return (ps?.nickname ?? "").toString().slice(0, 24);
   }
 
+  private _getFinishedPosition(sid: string): number {
+    const found = this.finishedOrder.find((x) => x.sid === sid);
+    return found ? found.position : 0;
+  }
+
+  private _buildChestWinnersPayload(): any[] {
+    return this.finishedOrder.slice(0, 3).map((entry) => ({
+      position: entry.position,
+      sessionId: entry.sid,
+      numero_giocatore: entry.numero,
+      nickname: entry.nickname,
+      is_bot: entry.isBot,
+      grant_chest: !entry.isBot,
+      chest_type: "rotating",
+    }));
+  }
+
+  private _registerFinish(sid: string): void {
+    if (this.matchTerminato) return;
+
+    const ps = this.state.players.get(sid);
+    if (!ps) return;
+    if (ps.punti < this.puntiVittoria) return;
+
+    if (this.finishedOrder.some((entry) => entry.sid === sid)) return;
+
+    const position = this.finishedOrder.length + 1;
+
+    const entry: FinishEntry = {
+      sid,
+      numero: ps.numero_giocatore,
+      position,
+      nickname: (ps.nickname ?? "").toString().slice(0, 24),
+      punti: ps.punti,
+      x: ps.x,
+      isBot: sid.startsWith("BOT_"),
+    };
+
+    this.finishedOrder.push(entry);
+
+    this.broadcast("player_finished", {
+      sessionId: sid,
+      numero_giocatore: entry.numero,
+      posizione: entry.position,
+      position: entry.position,
+      nickname: entry.nickname,
+      punti: entry.punti,
+      is_bot: entry.isBot,
+    });
+
+    this._markLeaderboardDirty();
+
+    if (this.finishedOrder.length >= 3) {
+      this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
+    }
+  }
+
   private async _buildWinnerBadgePayload(
     winnerSid: string
   ): Promise<{
@@ -600,29 +669,43 @@ export class DerbyRoom extends Room<DerbyState> {
     };
   }
 
-  private async _fineGara(
-    winnerSid: string,
-    numero: number,
-    tempo: number | null
-  ): Promise<void> {
+  private async _fineGara(tempo: number | null): Promise<void> {
     if (this.matchTerminato) return;
 
     this.matchTerminato = true;
     this._clearAllTimers();
 
     const matchId = this.matchId ?? `${this.roomId}-${Date.now()}`;
+    const primo = this.finishedOrder[0] ?? null;
+    const secondo = this.finishedOrder[1] ?? null;
+    const terzo = this.finishedOrder[2] ?? null;
+
+    const winnerSid = primo?.sid ?? "";
+    const winnerNumero = primo?.numero ?? 0;
+    const winnerNick = winnerSid ? this._getNicknameBySid(winnerSid) : "";
+    const winnerBadge = winnerSid
+      ? await this._buildWinnerBadgePayload(winnerSid)
+      : await this._buildWinnerBadgePayload("");
+
+    const chestWinners = this._buildChestWinnersPayload();
     const finalBoard = this._buildLeaderboardPayload();
-    const winnerNick = this._getNicknameBySid(winnerSid);
-    const winnerBadge = await this._buildWinnerBadgePayload(winnerSid);
 
     this.broadcast("gara_finita", {
       matchId,
+
       winner: winnerSid,
-      numero_giocatore: numero,
+      numero_giocatore: winnerNumero,
       winner_points: this.puntiVittoria,
       winner_nick: winnerNick,
       tempo,
+
+      primo,
+      secondo,
+      terzo,
+      finished_order: this.finishedOrder,
+      chest_winners: chestWinners,
       classifica: finalBoard,
+
       ...winnerBadge,
     });
 
@@ -660,7 +743,15 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     try {
-      await this._pfApplyRankAfterMatch(matchId, winnerSid);
+      await this._pfGrantChestsToTop3(matchId);
+    } catch (e) {
+      console.error("[CHEST] top3 grant error:", e);
+    }
+
+    try {
+      if (winnerSid) {
+        await this._pfApplyRankAfterMatch(matchId, winnerSid);
+      }
     } catch (e) {
       console.error("[RANK] apply error:", e);
     }
@@ -719,7 +810,7 @@ export class DerbyRoom extends Room<DerbyState> {
         this._markLeaderboardDirty();
 
         if (ps.punti >= this.puntiVittoria && old < this.puntiVittoria) {
-          this._fineGara(bot.sid, bot.numero, null);
+          this._registerFinish(bot.sid);
         }
       };
 
@@ -752,6 +843,95 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      PlayFab helpers
      ========================= */
+  private async _pfGrantRotatingChest(
+    pfid: string,
+    matchId: string,
+    position: number
+  ): Promise<any | null> {
+    if (!PF_HOST || !PF_SECRET) return null;
+
+    const res = await fetch(`${PF_HOST}/Server/ExecuteCloudScript`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-SecretKey": PF_SECRET,
+      },
+      body: JSON.stringify({
+        PlayFabId: pfid,
+        FunctionName: "AddRotatingChest",
+        FunctionParameter: {
+          source: "ranked_top3",
+          matchId,
+          position,
+        },
+        GeneratePlayStreamEvent: true,
+      }),
+    });
+
+    const json = await res.json().catch(() => null);
+
+    if (json?.code !== 200) {
+      console.error("[PF][AddRotatingChest] FAILED:", {
+        http: res.status,
+        code: json?.code,
+        error: json?.error,
+        errorMessage: json?.errorMessage,
+        pfid,
+        matchId,
+        position,
+      });
+      return null;
+    }
+
+    return json?.data?.FunctionResult ?? null;
+  }
+
+  private async _pfGrantChestsToTop3(matchId: string): Promise<void> {
+    const top3 = this.finishedOrder.slice(0, 3);
+
+    await Promise.all(
+      top3.map(async (entry) => {
+        if (entry.isBot) return;
+
+        const pfid = this.sid2pf.get(entry.sid);
+        if (!pfid) return;
+
+        const cli = this.clients.find((x) => x.sessionId === entry.sid);
+
+        try {
+          const result = await this._pfGrantRotatingChest(
+            pfid,
+            matchId,
+            entry.position
+          );
+
+          if (cli) {
+            cli.send("chest_awarded", {
+              matchId,
+              position: entry.position,
+              result,
+            });
+          }
+        } catch (e) {
+          console.error("[CHEST] grant error:", {
+            sid: entry.sid,
+            pfid,
+            position: entry.position,
+            e,
+          });
+
+          if (cli) {
+            cli.send("chest_award_failed", {
+              matchId,
+              position: entry.position,
+              error: "CHEST_GRANT_FAILED",
+            });
+          }
+        }
+      })
+    );
+  }
+
   private async _pfAddCurrency(
     pfid: string,
     code: string,
@@ -1017,10 +1197,21 @@ export class DerbyRoom extends Room<DerbyState> {
         nickname: ps.nickname,
         punti: ps.punti,
         x: ps.x,
+        finished_position: this._getFinishedPosition(sid),
+        is_bot: sid.startsWith("BOT_"),
       });
     });
 
-    return list.sort((a, b) => b.punti - a.punti || b.x - a.x);
+    return list.sort((a, b) => {
+      const af = a.finished_position | 0;
+      const bf = b.finished_position | 0;
+
+      if (af > 0 && bf > 0) return af - bf;
+      if (af > 0) return -1;
+      if (bf > 0) return 1;
+
+      return b.punti - a.punti || b.x - a.x;
+    });
   }
 
   private _startLeaderboardTicker(ms: number): void {
