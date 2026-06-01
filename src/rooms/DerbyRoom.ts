@@ -44,7 +44,7 @@ const BOT_START_DELAY_MS = 4500;
    Bot cosmetics / names
    ========================= */
 const BOT_MOUNT_SKINS_COUNT = 6;
-const BOT_JOCKEY_SKINS_COUNT = 12;
+const BOT_JOCKEY_SKINS_COUNT = 6;
 
 const BOT_NAMES = [
   "Alberto",
