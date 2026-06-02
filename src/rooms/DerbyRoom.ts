@@ -258,6 +258,17 @@ export class DerbyRoom extends Room<DerbyState> {
             FRAME_ID_OFFSET,
             safeNum(msg?.frame_id, FRAME_ID_OFFSET) | 0
           );
+
+          this.broadcast("badge_cosmetics_update", {
+            sessionId: client.sessionId,
+            numero_giocatore: p.numero_giocatore,
+            avatar_id: p.avatar_id,
+            avatar_bg_id: p.avatar_bg_id,
+            plate_id: p.plate_id,
+            frame_id: p.frame_id,
+          });
+
+          this._markLeaderboardDirty();
         } catch (e) {
           console.error("[set_badge_cosmetics] error:", e);
         }
@@ -614,6 +625,10 @@ export class DerbyRoom extends Room<DerbyState> {
       nickname: entry.nickname,
       punti: entry.punti,
       is_bot: entry.isBot,
+      avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
+      avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
+      plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+      frame_id: ps.frame_id ?? FRAME_ID_OFFSET,
     });
 
     this._markLeaderboardDirty();
@@ -1199,6 +1214,11 @@ export class DerbyRoom extends Room<DerbyState> {
         x: ps.x,
         finished_position: this._getFinishedPosition(sid),
         is_bot: sid.startsWith("BOT_"),
+        jockey_skin_id: ps.jockey_skin_id ?? 0,
+        avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
+        avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
+        plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+        frame_id: ps.frame_id ?? FRAME_ID_OFFSET,
       });
     });
 
@@ -1311,5 +1331,7 @@ export class DerbyRoom extends Room<DerbyState> {
         skin_id: ps.jockey_skin_id,
       });
     }
+
+    this._markLeaderboardDirty();
   }
 }
