@@ -96,6 +96,10 @@ function shuffleArray<T>(arr: T[]): T[] {
   return copy;
 }
 
+function botJockeyId(jockeySkinId: number): number {
+  return JOCKEY_ID_OFFSET + Math.max(0, jockeySkinId | 0);
+}
+
 /* =========================
    State
    ========================= */
@@ -729,12 +733,13 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     if (winnerSid.startsWith("BOT_")) {
+      const botJockey = botJockeyId(ps.jockey_skin_id);
       return {
         winner_human_id: 0,
         winner_hair_id: 0,
         winner_hair_color: 0,
-        winner_jockey_id: 0,
-        winner_avatar_id: 0,
+        winner_jockey_id: botJockey,
+        winner_avatar_id: botJockey,
         winner_badge_bg_id: 0,
         winner_badge_plate_id: 0,
         winner_badge_frame_id: 0,
@@ -1404,8 +1409,8 @@ export class DerbyRoom extends Room<DerbyState> {
       ps.human_id = 0;
       ps.hair_id = 0;
       ps.hair_color = 0;
-      ps.jockey_id = 0;
-      ps.avatar_id = 0;
+      ps.jockey_id = botJockeyId(ps.jockey_skin_id);
+      ps.avatar_id = ps.jockey_id;
       ps.avatar_bg_id = 0;
       ps.plate_id = 0;
       ps.frame_id = 0;
