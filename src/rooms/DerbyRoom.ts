@@ -201,7 +201,7 @@ export class DerbyRoom extends Room<DerbyState> {
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
 
-        const skin = clamp((safeNum(msg?.skin_id, 0) | 0), 0, 23);
+        const skin = Math.max(0, safeNum(msg?.skin_id, 0) | 0);
         p.mount_skin_id = skin;
 
         this.broadcast("mount_skin_update", {
