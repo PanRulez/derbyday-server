@@ -173,6 +173,8 @@ export class DerbyRoom extends Room<DerbyState> {
   private readonly INACTIVITY_TIMEOUT = 60000;
 
   private matchEarnedCO = new Map<string, number>();
+  private chestGrantInFlight = new Set<string>();
+  private chestGrantDone = new Set<string>();
 
   onCreate(): void {
     this.setState(new DerbyState());
@@ -192,6 +194,30 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.onMessage("heartbeat", (client) => {
       this.lastActivity.set(client.sessionId, Date.now());
+    });
+
+    this.onMessage("claim_ranked_chest", (client) => {
+      try {
+        this.lastActivity.set(client.sessionId, Date.now());
+
+        const entry = this.finishedOrder.find(
+          (item) => item.sid === client.sessionId && item.position >= 1 && item.position <= 3
+        );
+        if (!entry) {
+          client.send("chest_award_failed", {
+            matchId: this.matchId ?? "",
+            position: 0,
+            error: "NOT_TOP3_FINISHED",
+          });
+          return;
+        }
+
+        this._grantChestForFinishEntry(entry).catch((e) =>
+          console.error("[CHEST] claim_ranked_chest error:", e)
+        );
+      } catch (e) {
+        console.error("[claim_ranked_chest] error:", e);
+      }
     });
 
     this.onMessage("set_mount_skin", (client, msg: { skin_id: number }) => {
@@ -502,6 +528,8 @@ export class DerbyRoom extends Room<DerbyState> {
     this._spawnBotsIfNeeded();
     this.matchId = `${this.roomId}-${Date.now()}`;
     this.matchEarnedCO.clear();
+    this.chestGrantInFlight.clear();
+    this.chestGrantDone.clear();
     this.finishedOrder = [];
 
     this.broadcast("match_started", { matchId: this.matchId });
@@ -691,6 +719,9 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     this._markLeaderboardDirty();
+    this._grantChestForFinishEntry(entry).catch((e) =>
+      console.error("[CHEST] immediate grant error:", e)
+    );
 
     if (this.finishedOrder.length >= 3) {
       this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
@@ -994,45 +1025,70 @@ export class DerbyRoom extends Room<DerbyState> {
 
     await Promise.all(
       top3.map(async (entry) => {
-        if (entry.isBot) return;
-
-        const pfid = this.sid2pf.get(entry.sid);
-        if (!pfid) return;
-
-        const cli = this.clients.find((x) => x.sessionId === entry.sid);
-
-        try {
-          const result = await this._pfGrantRotatingChest(
-            pfid,
-            matchId,
-            entry.position
-          );
-
-          if (cli) {
-            cli.send("chest_awarded", {
-              matchId,
-              position: entry.position,
-              result,
-            });
-          }
-        } catch (e) {
-          console.error("[CHEST] grant error:", {
-            sid: entry.sid,
-            pfid,
-            position: entry.position,
-            e,
-          });
-
-          if (cli) {
-            cli.send("chest_award_failed", {
-              matchId,
-              position: entry.position,
-              error: "CHEST_GRANT_FAILED",
-            });
-          }
-        }
+        await this._grantChestForFinishEntry(entry, matchId);
       })
     );
+  }
+
+  private _chestGrantKey(matchId: string, entry: FinishEntry): string {
+    return `${matchId}:${entry.sid}:${entry.position}`;
+  }
+
+  private async _grantChestForFinishEntry(
+    entry: FinishEntry,
+    matchIdOverride: string | null = null
+  ): Promise<void> {
+    if (entry.isBot) return;
+    if (entry.position < 1 || entry.position > 3) return;
+
+    const matchId = matchIdOverride ?? this.matchId ?? `${this.roomId}-${Date.now()}`;
+    const key = this._chestGrantKey(matchId, entry);
+    if (this.chestGrantDone.has(key) || this.chestGrantInFlight.has(key)) return;
+
+    const pfid = this.sid2pf.get(entry.sid);
+    const cli = this.clients.find((x) => x.sessionId === entry.sid);
+    if (!pfid) return;
+
+    this.chestGrantInFlight.add(key);
+
+    try {
+      const result = await this._pfGrantRotatingChest(
+        pfid,
+        matchId,
+        entry.position
+      );
+
+      if (!result || result.ok === false) {
+        throw new Error("EMPTY_CHEST_RESULT");
+      }
+
+      this.chestGrantDone.add(key);
+
+      if (cli) {
+        cli.send("chest_awarded", {
+          matchId,
+          position: entry.position,
+          result,
+        });
+      }
+    } catch (e) {
+      console.error("[CHEST] grant error:", {
+        sid: entry.sid,
+        pfid,
+        position: entry.position,
+        e,
+      });
+
+      if (cli) {
+        cli.send("chest_award_failed", {
+          matchId,
+          position: entry.position,
+          error: "CHEST_GRANT_FAILED",
+        });
+      }
+    } finally {
+      this.chestGrantInFlight.delete(key);
+    }
   }
 
   private async _pfAddCurrency(
