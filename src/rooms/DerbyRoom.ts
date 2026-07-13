@@ -15,9 +15,47 @@ const VC_SECOND = "GE";
    RANKING
    ========================= */
 const RANK_STAT = "RankRating";
-const RANK_WIN_DELTA = 25;
-const RANK_LOSE_DELTA = -5;
 const RANK_MIN = 0;
+
+type RankLeagueRule = {
+  minRating: number;
+  deltas: number[];
+  forfeitPenalty: number;
+};
+
+// Deve restare allineato al catalogo RankManager del client. Il calcolo vero
+// vive qui sul server: il client riceve soltanto valore e delta risultanti.
+const RANK_LEAGUE_RULES: RankLeagueRule[] = [
+  { minRating: 0, deltas: [40, 25, 15, -5, -5, -5], forfeitPenalty: 5 },
+  { minRating: 150, deltas: [35, 22, 12, -10, -10, -10], forfeitPenalty: 10 },
+  { minRating: 400, deltas: [30, 18, 10, -15, -15, -15], forfeitPenalty: 15 },
+  { minRating: 800, deltas: [25, 15, 8, -20, -20, -20], forfeitPenalty: 20 },
+  { minRating: 1400, deltas: [20, 12, 5, -25, -25, -25], forfeitPenalty: 25 },
+];
+
+type RankedAuth = {
+  playfabId: string;
+};
+
+type ShotProof = {
+  id: number;
+  createdAt: number;
+  consumed: boolean;
+};
+
+type RankSyncPayload = {
+  matchId: string;
+  previous_value: number;
+  value: number;
+  delta: number;
+  placement: number;
+  reason: "match" | "forfeit" | "sync";
+};
+
+const VALID_HOLE_SCORES = new Set([1, 2, 4]);
+const MIN_SCORE_AFTER_SHOT_MS = 100;
+const MAX_SCORE_AFTER_SHOT_MS = 45000;
+const MIN_ACCEPTED_SCORE_INTERVAL_MS = 500;
 
 /* =========================
    Track
@@ -96,6 +134,54 @@ function shuffleArray<T>(arr: T[]): T[] {
   return copy;
 }
 
+function getRankRule(rating: number): RankLeagueRule {
+  const safeRating = Math.max(RANK_MIN, rating | 0);
+  let selected = RANK_LEAGUE_RULES[0];
+
+  for (const rule of RANK_LEAGUE_RULES) {
+    if (rule.minRating > safeRating) break;
+    selected = rule;
+  }
+
+  return selected;
+}
+
+function getRankDeltaForPlacement(rating: number, placement: number): number {
+  const rule = getRankRule(rating);
+  const safePlacement = clamp(placement | 0, 1, rule.deltas.length);
+  return rule.deltas[safePlacement - 1] ?? 0;
+}
+
+async function authenticatePlayFabSessionTicket(sessionTicket: string): Promise<RankedAuth> {
+  if (!PF_HOST || !PF_SECRET) {
+    throw new Error("RANK_AUTH_SERVER_NOT_CONFIGURED");
+  }
+
+  const ticket = String(sessionTicket || "").trim();
+  if (!ticket) {
+    throw new Error("PLAYFAB_SESSION_TICKET_MISSING");
+  }
+
+  const response = await fetch(`${PF_HOST}/Server/AuthenticateSessionTicket`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-SecretKey": PF_SECRET,
+    },
+    body: JSON.stringify({ SessionTicket: ticket }),
+  });
+
+  const json = await response.json().catch(() => null);
+  const expired = json?.data?.IsSessionTicketExpired === true;
+  const playfabId = String(json?.data?.UserInfo?.PlayFabId || "").trim();
+
+  if (!response.ok || json?.code !== 200 || expired || !playfabId) {
+    throw new Error(expired ? "PLAYFAB_SESSION_EXPIRED" : "PLAYFAB_SESSION_INVALID");
+  }
+
+  return { playfabId };
+}
+
 function botJockeyId(jockeySkinId: number): number {
   return JOCKEY_ID_OFFSET + Math.max(0, jockeySkinId | 0);
 }
@@ -169,6 +255,12 @@ export class DerbyRoom extends Room<DerbyState> {
   private lastPosTs = new Map<string, number>();
   private readonly POS_MIN_INTERVAL_MS = 50;
 
+  private lastShotBySid = new Map<string, ShotProof>();
+  private lastScoreEventBySid = new Map<string, number>();
+  private lastAcceptedScoreAtBySid = new Map<string, number>();
+  private forfeitSids = new Set<string>();
+  private forfeitRequests = new Map<string, Promise<RankSyncPayload>>();
+
   private lastActivity = new Map<string, number>();
   private readonly INACTIVITY_TIMEOUT = 60000;
 
@@ -194,6 +286,33 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.onMessage("heartbeat", (client) => {
       this.lastActivity.set(client.sessionId, Date.now());
+    });
+
+    this.onMessage("forfeit", async (client, msg: any) => {
+      this.lastActivity.set(client.sessionId, Date.now());
+
+      if (!this._isForfeitEligible(client.sessionId)) {
+        client.send("forfeit_ack", {
+          ok: false,
+          reason: "FORFEIT_NOT_ELIGIBLE",
+        });
+        return;
+      }
+
+      try {
+        const result = await this._applyForfeitPenalty(client.sessionId);
+        client.send("forfeit_ack", {
+          ok: true,
+          event_id: String(msg?.event_id || ""),
+          rank_sync: result,
+        });
+      } catch (e) {
+        console.error("[FORFEIT] apply error:", e);
+        client.send("forfeit_ack", {
+          ok: false,
+          reason: "FORFEIT_APPLY_FAILED",
+        });
+      }
     });
 
     this.onMessage("claim_ranked_chest", (client) => {
@@ -383,21 +502,65 @@ export class DerbyRoom extends Room<DerbyState> {
 
     // IMPORTANTE:
     // qui il payload è interpretato come punti della singola buca: 1 / 2 / 4
-    this.onMessage("aggiorna_punti", (client, punti_buca: number) => {
+    this.onMessage("aggiorna_punti", (client, msg: any) => {
       try {
         this.lastActivity.set(client.sessionId, Date.now());
-        if (this.matchTerminato || !this.matchLanciato) return;
+        if (this.matchTerminato || !this.matchLanciato) {
+          this._rejectScore(client, "MATCH_NOT_ACTIVE");
+          return;
+        }
 
         const p = this.state.players.get(client.sessionId);
-        if (!p) return;
+        if (!p) {
+          this._rejectScore(client, "PLAYER_NOT_FOUND");
+          return;
+        }
+
+        if (!msg || typeof msg !== "object") {
+          this._rejectScore(client, "INVALID_SCORE_PAYLOAD");
+          return;
+        }
+
+        const delta = safeNum(msg.points, 0) | 0;
+        const shotId = safeNum(msg.shot_id, 0) | 0;
+        const eventId = safeNum(msg.event_id, 0) | 0;
+        const lastEventId = this.lastScoreEventBySid.get(client.sessionId) ?? 0;
+
+        if (!VALID_HOLE_SCORES.has(delta)) {
+          this._rejectScore(client, "INVALID_SCORE_VALUE");
+          return;
+        }
+
+        if (eventId <= lastEventId) {
+          this._rejectScore(client, "SCORE_EVENT_REPLAY");
+          return;
+        }
+        this.lastScoreEventBySid.set(client.sessionId, eventId);
+
+        const shot = this.lastShotBySid.get(client.sessionId);
+        if (!shot || shot.id !== shotId || shot.consumed) {
+          this._rejectScore(client, "SHOT_PROOF_MISSING");
+          return;
+        }
+
+        const now = Date.now();
+        const flightTime = now - shot.createdAt;
+        if (flightTime < MIN_SCORE_AFTER_SHOT_MS || flightTime > MAX_SCORE_AFTER_SHOT_MS) {
+          this._rejectScore(client, "SHOT_PROOF_EXPIRED");
+          return;
+        }
+
+        const lastAcceptedAt = this.lastAcceptedScoreAtBySid.get(client.sessionId) ?? 0;
+        if (now - lastAcceptedAt < MIN_ACCEPTED_SCORE_INTERVAL_MS) {
+          this._rejectScore(client, "SCORE_RATE_LIMITED");
+          return;
+        }
+
+        shot.consumed = true;
+        this.lastShotBySid.set(client.sessionId, shot);
+        this.lastAcceptedScoreAtBySid.set(client.sessionId, now);
 
         const old = p.punti;
-
-        let delta = safeNum(punti_buca, 0) | 0;
-        delta = clamp(delta, 0, 4);
-
-        if (delta <= 0) return;
-
         const target = Math.min(old + delta, this.puntiVittoria);
         if (target === old) return;
 
@@ -413,6 +576,9 @@ export class DerbyRoom extends Room<DerbyState> {
           sessionId: client.sessionId,
           numero_giocatore: p.numero_giocatore,
           punti: p.punti,
+          delta: appliedDelta,
+          shot_id: shotId,
+          event_id: eventId,
         });
 
         this.broadcast("pos_update", {
@@ -430,6 +596,7 @@ export class DerbyRoom extends Room<DerbyState> {
         }
       } catch (e) {
         console.error("[aggiorna_punti] error:", e);
+        this._rejectScore(client, "SCORE_INTERNAL_ERROR");
       }
     });
 
@@ -467,9 +634,22 @@ export class DerbyRoom extends Room<DerbyState> {
         const fz = safeNum(msg?.fz, 0);
         const x = safeNum(msg?.x, p.x);
         const z = safeNum(msg?.z, p.z);
+        const shotId = safeNum(msg?.shot_id, 0) | 0;
+
+        const previousShot = this.lastShotBySid.get(client.sessionId);
+        if (shotId <= 0 || (previousShot && shotId <= previousShot.id)) return;
+
+        const forceLength = Math.hypot(fx, fz);
+        if (!Number.isFinite(forceLength) || forceLength < 0.25 || forceLength > 250) return;
 
         const fxC = clamp(fx, -200, 200);
         const fzC = clamp(fz, -200, 200);
+
+        this.lastShotBySid.set(client.sessionId, {
+          id: shotId,
+          createdAt: Date.now(),
+          consumed: false,
+        });
 
         this.broadcast(
           "lancio_update",
@@ -480,6 +660,7 @@ export class DerbyRoom extends Room<DerbyState> {
             fz: fzC,
             x,
             z,
+            shot_id: shotId,
           },
           { except: client }
         );
@@ -531,9 +712,14 @@ export class DerbyRoom extends Room<DerbyState> {
     this.chestGrantInFlight.clear();
     this.chestGrantDone.clear();
     this.finishedOrder = [];
+    this.lastShotBySid.clear();
+    this.lastScoreEventBySid.clear();
+    this.lastAcceptedScoreAtBySid.clear();
+    this.forfeitSids.clear();
+    this.forfeitRequests.clear();
 
     this.broadcast("match_started", { matchId: this.matchId });
-    this.broadcast("inizia_match");
+    this.broadcast("inizia_match", { matchId: this.matchId });
 
     this._startLeaderboardTicker(300);
 
@@ -547,7 +733,24 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Join / Leave
      ========================= */
-  onJoin(client: Client, options: any): void {
+  async onAuth(_client: Client, options: any): Promise<RankedAuth> {
+    const auth = await authenticatePlayFabSessionTicket(
+      String(options?.sessionTicket || options?.session_ticket || "")
+    );
+
+    const claimedPlayFabId = String(options?.playfabId || "").trim();
+    if (claimedPlayFabId && claimedPlayFabId !== auth.playfabId) {
+      throw new Error("PLAYFAB_IDENTITY_MISMATCH");
+    }
+
+    if (Array.from(this.sid2pf.values()).includes(auth.playfabId)) {
+      throw new Error("PLAYFAB_ACCOUNT_ALREADY_IN_ROOM");
+    }
+
+    return auth;
+  }
+
+  onJoin(client: Client, options: any, auth: RankedAuth): void {
     this.lastActivity.set(client.sessionId, Date.now());
 
     if (this.matchTerminato || this.matchLanciato) {
@@ -563,7 +766,7 @@ export class DerbyRoom extends Room<DerbyState> {
     p.nickname = String(options?.nickname || `Player ${numero}`).slice(0, 24);
     this.state.players.set(client.sessionId, p);
 
-    const pfid = String(options?.playfabId || "");
+    const pfid = String(auth?.playfabId || "").trim();
     if (pfid) {
       this.sid2pf.set(client.sessionId, pfid);
 
@@ -583,8 +786,11 @@ export class DerbyRoom extends Room<DerbyState> {
         .then((curRank) => {
           client.send("rank_sync", {
             matchId: "",
+            previous_value: (curRank ?? 0) | 0,
             value: (curRank ?? 0) | 0,
             delta: 0,
+            placement: 0,
+            reason: "sync",
           });
         })
         .catch((err) => console.error("[_pfGetRank][onJoin] error:", err));
@@ -622,10 +828,19 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  onLeave(client: Client): void {
+  async onLeave(client: Client): Promise<void> {
     try {
+      if (this._isForfeitEligible(client.sessionId)) {
+        await this._applyForfeitPenalty(client.sessionId).catch((e) =>
+          console.error("[FORFEIT][onLeave] error:", e)
+        );
+      }
+
       this.lastActivity.delete(client.sessionId);
       this.lastPosTs.delete(client.sessionId);
+      this.lastShotBySid.delete(client.sessionId);
+      this.lastScoreEventBySid.delete(client.sessionId);
+      this.lastAcceptedScoreAtBySid.delete(client.sessionId);
       this.sid2pf.delete(client.sessionId);
       this.matchEarnedCO.delete(client.sessionId);
 
@@ -647,6 +862,59 @@ export class DerbyRoom extends Room<DerbyState> {
 
   onDispose(): void {
     this._clearAllTimers();
+  }
+
+  private _rejectScore(client: Client, reason: string): void {
+    const player = this.state.players.get(client.sessionId);
+    client.send("score_rejected", {
+      reason,
+      numero_giocatore: player?.numero_giocatore ?? 0,
+      authoritative_score: player?.punti ?? 0,
+    });
+  }
+
+  private _isForfeitEligible(sid: string): boolean {
+    return (
+      this.matchLanciato &&
+      !this.matchTerminato &&
+      this.state.players.has(sid) &&
+      !this.finishedOrder.some((entry) => entry.sid === sid)
+    );
+  }
+
+  private _applyForfeitPenalty(sid: string): Promise<RankSyncPayload> {
+    const existing = this.forfeitRequests.get(sid);
+    if (existing) return existing;
+
+    this.forfeitSids.add(sid);
+
+    const request = (async () => {
+      const pfid = this.sid2pf.get(sid);
+      if (!pfid) throw new Error("FORFEIT_PLAYFAB_ID_MISSING");
+
+      const current = await this._pfGetRank(pfid);
+      const penalty = getRankRule(current).forfeitPenalty;
+      const matchId = this.matchId ?? `${this.roomId}-forfeit`;
+      const eventId = `${matchId}:forfeit:${pfid}`;
+
+      return this._pfApplyRankDelta(
+        pfid,
+        eventId,
+        -penalty,
+        0,
+        "forfeit",
+        matchId,
+        current
+      );
+    })();
+
+    this.forfeitRequests.set(sid, request);
+    request.catch(() => {
+      if (this.forfeitRequests.get(sid) === request) {
+        this.forfeitRequests.delete(sid);
+      }
+    });
+    return request;
   }
 
   /* =========================
@@ -844,6 +1112,14 @@ export class DerbyRoom extends Room<DerbyState> {
     });
 
     try {
+      if (winnerSid) {
+        await this._pfApplyRankAfterMatch(matchId);
+      }
+    } catch (e) {
+      console.error("[RANK] apply error:", e);
+    }
+
+    try {
       await Promise.all(
         this.clients.map(async (cli) => {
           const sid = cli.sessionId;
@@ -880,14 +1156,6 @@ export class DerbyRoom extends Room<DerbyState> {
       await this._pfGrantChestsToTop3(matchId);
     } catch (e) {
       console.error("[CHEST] top3 grant error:", e);
-    }
-
-    try {
-      if (winnerSid) {
-        await this._pfApplyRankAfterMatch(matchId, winnerSid);
-      }
-    } catch (e) {
-      console.error("[RANK] apply error:", e);
     }
 
     setTimeout(() => this.disconnect(), 10000);
@@ -1278,21 +1546,72 @@ export class DerbyRoom extends Room<DerbyState> {
     }
   }
 
-  private async _pfApplyRankAfterMatch(
+  private async _pfApplyRankDelta(
+    pfid: string,
+    eventId: string,
+    rawDelta: number,
+    placement: number,
+    reason: "match" | "forfeit",
     matchId: string,
-    winnerSid: string
-  ): Promise<void> {
+    knownCurrent?: number
+  ): Promise<RankSyncPayload> {
+    const current = Number.isFinite(knownCurrent)
+      ? Math.max(RANK_MIN, Number(knownCurrent) | 0)
+      : await this._pfGetRank(pfid);
+    const alreadyApplied = await this._pfWasRankAlreadyApplied(pfid, eventId);
+
+    if (alreadyApplied) {
+      return {
+        matchId,
+        previous_value: current | 0,
+        value: current | 0,
+        delta: 0,
+        placement,
+        reason,
+      };
+    }
+
+    const next = Math.max(RANK_MIN, (current + rawDelta) | 0);
+    const appliedDelta = next - current;
+    const ok = await this._pfSetRank(pfid, next);
+
+    if (!ok) {
+      throw new Error("RANK_STAT_UPDATE_FAILED");
+    }
+
+    await this._pfMarkRankApplied(pfid, eventId, appliedDelta, next);
+
+    return {
+      matchId,
+      previous_value: current | 0,
+      value: next | 0,
+      delta: appliedDelta,
+      placement,
+      reason,
+    };
+  }
+
+  private async _pfApplyRankAfterMatch(matchId: string): Promise<void> {
     if (!PF_HOST || !PF_SECRET) {
       console.error("[RANK] PF env missing (PF_HOST/PF_SECRET).");
       return;
     }
 
-    const entries: Array<{ sid: string; pfid: string }> = [];
+    const placementBySid = new Map<string, number>();
+    this._buildLeaderboardPayload().forEach((entry, index) => {
+      placementBySid.set(String(entry.sessionId || ""), index + 1);
+    });
+
+    const entries: Array<{ sid: string; pfid: string; placement: number }> = [];
 
     for (const c of this.clients) {
       const pfid = this.sid2pf.get(c.sessionId);
-      if (pfid) {
-        entries.push({ sid: c.sessionId, pfid });
+      if (pfid && !this.forfeitSids.has(c.sessionId)) {
+        entries.push({
+          sid: c.sessionId,
+          pfid,
+          placement: placementBySid.get(c.sessionId) ?? this.maxClients,
+        });
       }
     }
 
@@ -1302,39 +1621,23 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     await Promise.all(
-      entries.map(async ({ sid, pfid }) => {
-        const delta = sid === winnerSid ? RANK_WIN_DELTA : RANK_LOSE_DELTA;
-
+      entries.map(async ({ sid, pfid, placement }) => {
         try {
-          const already = await this._pfWasRankAlreadyApplied(pfid, matchId);
-          if (already) {
-            const cur = await this._pfGetRank(pfid);
-            const cli = this.clients.find((x) => x.sessionId === sid);
-            if (cli) {
-              cli.send("rank_sync", {
-                matchId,
-                value: cur | 0,
-                delta: 0,
-              });
-            }
-            return;
-          }
-
-          const cur = await this._pfGetRank(pfid);
-          const next = Math.max(RANK_MIN, (cur + delta) | 0);
-
-          const ok = await this._pfSetRank(pfid, next);
-          if (ok) {
-            await this._pfMarkRankApplied(pfid, matchId, delta, next);
-          }
+          const current = await this._pfGetRank(pfid);
+          const rawDelta = getRankDeltaForPlacement(current, placement);
+          const result = await this._pfApplyRankDelta(
+            pfid,
+            matchId,
+            rawDelta,
+            placement,
+            "match",
+            matchId,
+            current
+          );
 
           const cli = this.clients.find((x) => x.sessionId === sid);
           if (cli) {
-            cli.send("rank_sync", {
-              matchId,
-              value: (ok ? next : cur) | 0,
-              delta: ok ? delta : 0,
-            });
+            cli.send("rank_sync", result);
           }
         } catch (e) {
           console.error("[RANK] update error:", { pfid, sid, e });
