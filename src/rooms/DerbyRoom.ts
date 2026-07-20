@@ -57,6 +57,10 @@ const MIN_SCORE_AFTER_SHOT_MS = 100;
 const MAX_SCORE_AFTER_SHOT_MS = 45000;
 const MIN_ACCEPTED_SCORE_INTERVAL_MS = 500;
 
+// Spareggio pari-merito: se nessuno dei contendenti fa buca entro questo
+// tempo, gli slot restanti vengono assegnati nell'ordine congelato all'avvio.
+const SPAREGGIO_TIMEOUT_MS = 30000;
+
 /* =========================
    Track
    ========================= */
@@ -250,6 +254,37 @@ export class DerbyRoom extends Room<DerbyState> {
   bots: BotInfo[] = [];
   finishedOrder: FinishEntry[] = [];
   matchId: string | null = null;
+
+  // Regole podio: il primo arrivo a 21 chiude la gara; 2° e 3° vanno ai piu'
+  // vicini al traguardo in quel momento. I pari merito sul podio si risolvono
+  // con lo spareggio "prima buca vince" tra i soli contendenti.
+  spareggioActive = false;
+  spareggioPool: string[] = [];
+  spareggioOpenPositions: number[] = [];
+  spareggioTimer: NodeJS.Timeout | null = null;
+
+  // Finisher usciti prima di fine gara (es. il vincitore che non aspetta lo
+  // spareggio): snapshot per applicare comunque rank e CO a fine match.
+  private departedFinishers = new Map<
+    string,
+    { pfid: string; earnedCO: number; placement: number }
+  >();
+
+  // Cosmetici salvati al momento del piazzamento: se il vincitore esce prima
+  // della fine, il suo badge nella schermata finale resta corretto.
+  private finishCosmeticsBySid = new Map<
+    string,
+    {
+      human_id: number;
+      hair_id: number;
+      hair_color: number;
+      jockey_id: number;
+      avatar_id: number;
+      avatar_bg_id: number;
+      plate_id: number;
+      frame_id: number;
+    }
+  >();
 
   private sid2pf = new Map<string, string>();
   private lastPosTs = new Map<string, number>();
@@ -591,7 +626,13 @@ export class DerbyRoom extends Room<DerbyState> {
 
         this._markLeaderboardDirty();
 
-        if (p.punti >= this.puntiVittoria && old < this.puntiVittoria) {
+        if (this.spareggioActive) {
+          this._onSpareggioScore(client.sessionId);
+        } else if (
+          this.finishedOrder.length === 0 &&
+          p.punti >= this.puntiVittoria &&
+          old < this.puntiVittoria
+        ) {
           this._registerFinish(client.sessionId);
         }
       } catch (e) {
@@ -717,6 +758,11 @@ export class DerbyRoom extends Room<DerbyState> {
     this.lastAcceptedScoreAtBySid.clear();
     this.forfeitSids.clear();
     this.forfeitRequests.clear();
+    this.spareggioActive = false;
+    this.spareggioPool = [];
+    this.spareggioOpenPositions = [];
+    this.departedFinishers.clear();
+    this.finishCosmeticsBySid.clear();
 
     this.broadcast("match_started", { matchId: this.matchId });
     this.broadcast("inizia_match", { matchId: this.matchId });
@@ -836,6 +882,25 @@ export class DerbyRoom extends Room<DerbyState> {
         );
       }
 
+      // Chi ha gia' un piazzamento puo' uscire liberamente (es. il vincitore
+      // che non aspetta lo spareggio): salviamo pfid/CO/posizione per
+      // applicare comunque rank e monete a fine gara.
+      const finishedEntry = this.finishedOrder.find(
+        (entry) => entry.sid === client.sessionId
+      );
+      if (finishedEntry) {
+        const departedPfid = this.sid2pf.get(client.sessionId);
+        if (departedPfid) {
+          this.departedFinishers.set(client.sessionId, {
+            pfid: departedPfid,
+            earnedCO: this.matchEarnedCO.get(client.sessionId) ?? 0,
+            placement: finishedEntry.position,
+          });
+        }
+      }
+
+      this._removeFromSpareggio(client.sessionId);
+
       this.lastActivity.delete(client.sessionId);
       this.lastPosTs.delete(client.sessionId);
       this.lastShotBySid.delete(client.sessionId);
@@ -851,9 +916,21 @@ export class DerbyRoom extends Room<DerbyState> {
 
       const humansLeft = this.clients.length;
       if (humansLeft <= 0 && !this.matchTerminato) {
-        this.matchTerminato = true;
-        this._clearAllTimers();
-        this.disconnect();
+        if (this.spareggioActive) {
+          // Ultimo umano uscito con spareggio in corso: risolvi subito con
+          // l'ordine congelato e chiudi la gara (applica rank/CO ai partiti).
+          this._resolveSpareggioByTimeout();
+        } else if (this.matchLanciato && this.finishedOrder.length > 0) {
+          // Gara decisa ma non chiusa: chiudila comunque, cosi' il vincitore
+          // uscito in anticipo riceve rank e monete.
+          await this._fineGara(null).catch((e) =>
+            console.error("[_fineGara][onLeave] error:", e)
+          );
+        } else {
+          this.matchTerminato = true;
+          this._clearAllTimers();
+          this.disconnect();
+        }
       }
     } catch (e) {
       console.error("[onLeave] error:", e);
@@ -952,7 +1029,16 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.finishedOrder.some((entry) => entry.sid === sid)) return;
 
     const position = this.finishedOrder.length + 1;
+    this._pushFinishEntry(sid, position, ps);
 
+    // Nuove regole: il primo arrivo chiude la gara. 2° e 3° vengono assegnati
+    // subito ai piu' vicini al traguardo (spareggio sui pari merito).
+    if (position === 1) {
+      this._assignPodiumAfterFirstArrival();
+    }
+  }
+
+  private _pushFinishEntry(sid: string, position: number, ps: PlayerState): void {
     const entry: FinishEntry = {
       sid,
       numero: ps.numero_giocatore,
@@ -964,6 +1050,17 @@ export class DerbyRoom extends Room<DerbyState> {
     };
 
     this.finishedOrder.push(entry);
+
+    this.finishCosmeticsBySid.set(sid, {
+      human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+      hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
+      hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
+      jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
+      avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
+      avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
+      plate_id: ps.plate_id ?? PLATE_ID_OFFSET,
+      frame_id: ps.frame_id ?? FRAME_ID_OFFSET,
+    });
 
     this.broadcast("player_finished", {
       sessionId: sid,
@@ -990,10 +1087,169 @@ export class DerbyRoom extends Room<DerbyState> {
     this._grantChestForFinishEntry(entry).catch((e) =>
       console.error("[CHEST] immediate grant error:", e)
     );
+  }
 
-    if (this.finishedOrder.length >= 3) {
-      this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
+  // Registra un piazzamento per prossimita'/spareggio: con le nuove regole
+  // solo il primo taglia davvero il traguardo, 2° e 3° chiudono con i loro
+  // punti reali.
+  private _registerPlacementEntry(sid: string, position: number): void {
+    if (this.matchTerminato) return;
+    if (this.finishedOrder.some((entry) => entry.sid === sid)) return;
+
+    const ps = this.state.players.get(sid);
+    if (!ps) return;
+
+    this._pushFinishEntry(sid, position, ps);
+  }
+
+  private _assignPodiumAfterFirstArrival(): void {
+    if (this.matchTerminato || this.spareggioActive) return;
+
+    // Snapshot congelato al momento dell'arrivo del primo.
+    const candidates: Array<{
+      sid: string;
+      punti: number;
+      x: number;
+      numero: number;
+    }> = [];
+    this.state.players.forEach((ps, sid) => {
+      if (this.finishedOrder.some((entry) => entry.sid === sid)) return;
+      candidates.push({
+        sid,
+        punti: ps.punti,
+        x: ps.x,
+        numero: ps.numero_giocatore,
+      });
+    });
+    candidates.sort(
+      (a, b) => b.punti - a.punti || b.x - a.x || a.numero - b.numero
+    );
+
+    let nextPosition = 2;
+    let idx = 0;
+
+    while (nextPosition <= 3 && idx < candidates.length) {
+      const tieGroup = candidates.filter(
+        (c, i) => i >= idx && c.punti === candidates[idx].punti
+      );
+
+      if (tieGroup.length === 1) {
+        this._registerPlacementEntry(tieGroup[0].sid, nextPosition);
+        nextPosition += 1;
+        idx += 1;
+        continue;
+      }
+
+      // Pari merito sul podio: spareggio "prima buca vince" tra i soli pari.
+      const openPositions: number[] = [];
+      for (let pos = nextPosition; pos <= 3; pos++) openPositions.push(pos);
+      this._startSpareggio(
+        tieGroup.map((c) => c.sid),
+        openPositions
+      );
+      return;
     }
+
+    this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
+  }
+
+  private _startSpareggio(pool: string[], openPositions: number[]): void {
+    this.spareggioActive = true;
+    this.spareggioPool = [...pool];
+    this.spareggioOpenPositions = [...openPositions];
+
+    const contenders = this.spareggioPool.map((sid) => {
+      const ps = this.state.players.get(sid);
+      return {
+        sessionId: sid,
+        numero_giocatore: ps?.numero_giocatore ?? 0,
+        nickname: (ps?.nickname ?? "").toString().slice(0, 24),
+        punti: ps?.punti ?? 0,
+        is_bot: sid.startsWith("BOT_"),
+      };
+    });
+
+    this.broadcast("spareggio_start", {
+      positions: [...this.spareggioOpenPositions],
+      contenders,
+      timeout_ms: SPAREGGIO_TIMEOUT_MS,
+    });
+
+    this.spareggioTimer = setTimeout(() => {
+      this._resolveSpareggioByTimeout();
+    }, SPAREGGIO_TIMEOUT_MS);
+
+    this._trySettleSpareggio();
+  }
+
+  private _onSpareggioScore(sid: string): void {
+    if (!this.spareggioActive) return;
+    if (!this.spareggioPool.includes(sid)) return;
+    if (this.spareggioOpenPositions.length === 0) return;
+
+    const position = this.spareggioOpenPositions.shift()!;
+    this.spareggioPool = this.spareggioPool.filter((s) => s !== sid);
+    this._registerPlacementEntry(sid, position);
+    this._trySettleSpareggio();
+  }
+
+  private _trySettleSpareggio(): void {
+    if (!this.spareggioActive) return;
+
+    // L'ultimo rimasto non ha piu' rivali: prende lo slot senza attese.
+    while (
+      this.spareggioPool.length === 1 &&
+      this.spareggioOpenPositions.length > 0
+    ) {
+      const position = this.spareggioOpenPositions.shift()!;
+      const sid = this.spareggioPool.pop()!;
+      this._registerPlacementEntry(sid, position);
+    }
+
+    if (
+      this.spareggioOpenPositions.length === 0 ||
+      this.spareggioPool.length === 0
+    ) {
+      this._endSpareggio();
+    }
+  }
+
+  private _resolveSpareggioByTimeout(): void {
+    if (!this.spareggioActive) return;
+
+    // Nessuna buca entro il tempo: assegna gli slot rimasti nell'ordine
+    // congelato all'avvio dello spareggio.
+    while (
+      this.spareggioOpenPositions.length > 0 &&
+      this.spareggioPool.length > 0
+    ) {
+      const position = this.spareggioOpenPositions.shift()!;
+      const sid = this.spareggioPool.shift()!;
+      this._registerPlacementEntry(sid, position);
+    }
+
+    this._endSpareggio();
+  }
+
+  private _endSpareggio(): void {
+    if (this.spareggioTimer) {
+      clearTimeout(this.spareggioTimer);
+      this.spareggioTimer = null;
+    }
+
+    this.spareggioActive = false;
+    this.spareggioPool = [];
+    this.spareggioOpenPositions = [];
+
+    this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
+  }
+
+  private _removeFromSpareggio(sid: string): void {
+    if (!this.spareggioActive) return;
+    if (!this.spareggioPool.includes(sid)) return;
+
+    this.spareggioPool = this.spareggioPool.filter((s) => s !== sid);
+    this._trySettleSpareggio();
   }
 
   private async _buildWinnerBadgePayload(
@@ -1015,6 +1271,38 @@ export class DerbyRoom extends Room<DerbyState> {
     const ps = this.state.players.get(winnerSid);
 
     if (!ps) {
+      // Vincitore gia' uscito dalla room: usa lo snapshot dei cosmetici
+      // salvato al piazzamento, e il rank dal pfid conservato.
+      const snap = this.finishCosmeticsBySid.get(winnerSid);
+      if (snap) {
+        let rank = 0;
+        const pfid =
+          this.departedFinishers.get(winnerSid)?.pfid ??
+          this.sid2pf.get(winnerSid);
+        if (pfid && !winnerSid.startsWith("BOT_")) {
+          try {
+            rank = await this._pfGetRank(pfid);
+          } catch {
+            rank = 0;
+          }
+        }
+
+        return {
+          winner_human_id: snap.human_id,
+          winner_hair_id: snap.hair_id,
+          winner_hair_color: snap.hair_color,
+          winner_jockey_id: snap.jockey_id,
+          winner_avatar_id: snap.avatar_id,
+          winner_badge_bg_id: snap.avatar_bg_id,
+          winner_badge_plate_id: snap.plate_id,
+          winner_badge_frame_id: snap.frame_id,
+          winner_avatar_bg_id: snap.avatar_bg_id,
+          winner_plate_id: snap.plate_id,
+          winner_frame_id: snap.frame_id,
+          winner_rank: rank | 0,
+        };
+      }
+
       return {
         winner_human_id: HUMAN_ID_OFFSET,
         winner_hair_id: HAIR_ID_OFFSET,
@@ -1152,6 +1440,23 @@ export class DerbyRoom extends Room<DerbyState> {
       console.error("[CO] payout error:", e);
     }
 
+    // CO delle buche per i finisher usciti prima di fine gara: PlayFab viene
+    // comunque accreditato, il wallet si riallinea al prossimo login.
+    try {
+      const departedPayouts: Array<{ pfid: string; earnedCO: number }> = [];
+      this.departedFinishers.forEach((info) => {
+        if (info.earnedCO > 0) departedPayouts.push(info);
+      });
+
+      await Promise.all(
+        departedPayouts.map(async (info) => {
+          await this._pfAddCurrency(info.pfid, VC_PRIMARY, info.earnedCO);
+        })
+      );
+    } catch (e) {
+      console.error("[CO] departed payout error:", e);
+    }
+
     try {
       await this._pfGrantChestsToTop3(matchId);
     } catch (e) {
@@ -1211,7 +1516,13 @@ export class DerbyRoom extends Room<DerbyState> {
 
         this._markLeaderboardDirty();
 
-        if (ps.punti >= this.puntiVittoria && old < this.puntiVittoria) {
+        if (this.spareggioActive) {
+          this._onSpareggioScore(bot.sid);
+        } else if (
+          this.finishedOrder.length === 0 &&
+          ps.punti >= this.puntiVittoria &&
+          old < this.puntiVittoria
+        ) {
           this._registerFinish(bot.sid);
         }
       };
@@ -1232,6 +1543,11 @@ export class DerbyRoom extends Room<DerbyState> {
     if (this.leaderboardTimer) {
       clearInterval(this.leaderboardTimer);
       this.leaderboardTimer = null;
+    }
+
+    if (this.spareggioTimer) {
+      clearTimeout(this.spareggioTimer);
+      this.spareggioTimer = null;
     }
 
     this.bots.forEach((b) => {
@@ -1614,6 +1930,14 @@ export class DerbyRoom extends Room<DerbyState> {
         });
       }
     }
+
+    // Finisher usciti prima di fine gara: delta applicato con la posizione
+    // registrata al momento del piazzamento.
+    this.departedFinishers.forEach((info, sid) => {
+      if (this.forfeitSids.has(sid)) return;
+      if (entries.some((entry) => entry.sid === sid)) return;
+      entries.push({ sid, pfid: info.pfid, placement: info.placement });
+    });
 
     if (entries.length === 0) {
       console.error("[RANK] No human entries with playfabId.");
