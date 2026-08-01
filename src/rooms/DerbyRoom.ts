@@ -1121,33 +1121,25 @@ export class DerbyRoom extends Room<DerbyState> {
         numero: ps.numero_giocatore,
       });
     });
-    candidates.sort(
-      (a, b) => b.punti - a.punti || b.x - a.x || a.numero - b.numero
-    );
+    // Ordine per punti: e' la foto della corsa nel momento in cui il primo taglia. La x non
+    // entra piu' nel conto - la manda il client e a parita' di punti e' solo rumore
+    // dell'animazione, non merito di nessuno.
+    candidates.sort((a, b) => b.punti - a.punti || a.numero - b.numero);
 
-    let nextPosition = 2;
-    let idx = 0;
+    // Pari merito: chi ha gli stessi punti divide il posto, e chi viene dopo salta i posti
+    // occupati. Primo a 21, due secondi a 19, il prossimo e' quarto a 15: fuori dal podio.
+    let position = 1;
+    let assigned = 1;
+    let previousPunti = Number.NaN;
 
-    while (nextPosition <= 3 && idx < candidates.length) {
-      const tieGroup = candidates.filter(
-        (c, i) => i >= idx && c.punti === candidates[idx].punti
-      );
-
-      if (tieGroup.length === 1) {
-        this._registerPlacementEntry(tieGroup[0].sid, nextPosition);
-        nextPosition += 1;
-        idx += 1;
-        continue;
+    for (const candidate of candidates) {
+      assigned += 1;
+      if (candidate.punti !== previousPunti) {
+        position = assigned;
+        previousPunti = candidate.punti;
       }
-
-      // Pari merito sul podio: spareggio "prima buca vince" tra i soli pari.
-      const openPositions: number[] = [];
-      for (let pos = nextPosition; pos <= 3; pos++) openPositions.push(pos);
-      this._startSpareggio(
-        tieGroup.map((c) => c.sid),
-        openPositions
-      );
-      return;
+      if (position > 3) break;
+      this._registerPlacementEntry(candidate.sid, position);
     }
 
     this._fineGara(null).catch((e) => console.error("[_fineGara] error:", e));
@@ -1907,16 +1899,37 @@ export class DerbyRoom extends Room<DerbyState> {
     };
   }
 
+  /**
+   * Piazzamento finale per il delta rank, con i pari merito. La posizione nella lista non basta:
+   * a parita' di punti il posto si divide, e chi viene dopo salta quelli occupati. Con primo a 21,
+   * due secondi a 19 e uno a 15, quest'ultimo e' quarto - non terzo.
+   */
+  private _buildPlacementsWithTies(): Map<string, number> {
+    const placements = new Map<string, number>();
+    let placement = 0;
+    let assigned = 0;
+    let previousKey = "";
+
+    this._buildLeaderboardPayload().forEach((entry) => {
+      const key = `${entry.finished_position | 0}:${entry.punti | 0}`;
+      assigned += 1;
+      if (key !== previousKey) {
+        placement = assigned;
+        previousKey = key;
+      }
+      placements.set(String(entry.sessionId || ""), placement);
+    });
+
+    return placements;
+  }
+
   private async _pfApplyRankAfterMatch(matchId: string): Promise<void> {
     if (!PF_HOST || !PF_SECRET) {
       console.error("[RANK] PF env missing (PF_HOST/PF_SECRET).");
       return;
     }
 
-    const placementBySid = new Map<string, number>();
-    this._buildLeaderboardPayload().forEach((entry, index) => {
-      placementBySid.set(String(entry.sessionId || ""), index + 1);
-    });
+    const placementBySid = this._buildPlacementsWithTies();
 
     const entries: Array<{ sid: string; pfid: string; placement: number }> = [];
 
