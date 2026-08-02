@@ -764,8 +764,12 @@ export class DerbyRoom extends Room<DerbyState> {
     this.departedFinishers.clear();
     this.finishCosmeticsBySid.clear();
 
-    this.broadcast("match_started", { matchId: this.matchId });
+    // inizia_match PRIMA di match_started: il client usa il primo per far partire il
+    // countdown 3-2-1-VIA, e il secondo solo come riallineamento per chi rientra a gara in
+    // corso. Con l'ordine invertito il riallineamento consumava l'avvio e il countdown non
+    // si vedeva mai: gara partita di colpo e bottone vuoto.
     this.broadcast("inizia_match", { matchId: this.matchId });
+    this.broadcast("match_started", { matchId: this.matchId });
 
     this._startLeaderboardTicker(300);
 
