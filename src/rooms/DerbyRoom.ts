@@ -105,8 +105,6 @@ const BOT_NAMES = [
    Badge composition defaults
    ========================= */
 const HUMAN_ID_OFFSET = 1000;
-const HAIR_ID_OFFSET = 2000;
-const HAIR_COLOR_DEFAULT = 1;
 const JOCKEY_ID_OFFSET = 4000;
 const AVATAR_ID_OFFSET = JOCKEY_ID_OFFSET; // legacy alias for jockey_id
 const AVATAR_BG_ID_OFFSET = 7000;
@@ -210,8 +208,6 @@ class PlayerState extends Schema {
   @type("number") frame_id: number = FRAME_ID_OFFSET;
 
   @type("number") human_id: number = HUMAN_ID_OFFSET;
-  @type("number") hair_id: number = HAIR_ID_OFFSET;
-  @type("number") hair_color: number = HAIR_COLOR_DEFAULT;
   @type("number") jockey_id: number = JOCKEY_ID_OFFSET;
 }
 
@@ -276,8 +272,6 @@ export class DerbyRoom extends Room<DerbyState> {
     string,
     {
       human_id: number;
-      hair_id: number;
-      hair_color: number;
       jockey_id: number;
       avatar_id: number;
       avatar_bg_id: number;
@@ -424,8 +418,6 @@ export class DerbyRoom extends Room<DerbyState> {
         client,
         msg: {
           human_id?: number;
-          hair_id?: number;
-          hair_color?: number;
           jockey_id?: number;
           avatar_id?: number;
           badge_bg_id?: number;
@@ -445,15 +437,6 @@ export class DerbyRoom extends Room<DerbyState> {
           p.human_id = Math.max(
             HUMAN_ID_OFFSET,
             safeNum(msg?.human_id, HUMAN_ID_OFFSET) | 0
-          );
-          p.hair_id = Math.max(
-            HAIR_ID_OFFSET,
-            safeNum(msg?.hair_id, HAIR_ID_OFFSET) | 0
-          );
-          p.hair_color = clamp(
-            safeNum(msg?.hair_color, HAIR_COLOR_DEFAULT) | 0,
-            0,
-            4
           );
           p.jockey_id = Math.max(
             JOCKEY_ID_OFFSET,
@@ -480,8 +463,6 @@ export class DerbyRoom extends Room<DerbyState> {
             sessionId: client.sessionId,
             numero_giocatore: p.numero_giocatore,
             human_id: p.human_id,
-            hair_id: p.hair_id,
-            hair_color: p.hair_color,
             jockey_id: p.jockey_id,
             avatar_id: p.avatar_id,
             badge_bg_id: p.avatar_bg_id,
@@ -857,8 +838,6 @@ export class DerbyRoom extends Room<DerbyState> {
         mount_skin_id: ps.mount_skin_id ?? 0,
         jockey_skin_id: ps.jockey_skin_id ?? 0,
         human_id: ps.human_id ?? HUMAN_ID_OFFSET,
-        hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
-        hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
         jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
         avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
         badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1057,8 +1036,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.finishCosmeticsBySid.set(sid, {
       human_id: ps.human_id ?? HUMAN_ID_OFFSET,
-      hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
-      hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
       jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1075,8 +1052,6 @@ export class DerbyRoom extends Room<DerbyState> {
       punti: entry.punti,
       is_bot: entry.isBot,
       human_id: ps.human_id ?? HUMAN_ID_OFFSET,
-      hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
-      hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
       jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1252,8 +1227,6 @@ export class DerbyRoom extends Room<DerbyState> {
     winnerSid: string
   ): Promise<{
     winner_human_id: number;
-    winner_hair_id: number;
-    winner_hair_color: number;
     winner_jockey_id: number;
     winner_avatar_id: number;
     winner_badge_bg_id: number;
@@ -1285,8 +1258,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
         return {
           winner_human_id: snap.human_id,
-          winner_hair_id: snap.hair_id,
-          winner_hair_color: snap.hair_color,
           winner_jockey_id: snap.jockey_id,
           winner_avatar_id: snap.avatar_id,
           winner_badge_bg_id: snap.avatar_bg_id,
@@ -1301,8 +1272,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
       return {
         winner_human_id: HUMAN_ID_OFFSET,
-        winner_hair_id: HAIR_ID_OFFSET,
-        winner_hair_color: HAIR_COLOR_DEFAULT,
         winner_jockey_id: JOCKEY_ID_OFFSET,
         winner_avatar_id: AVATAR_ID_OFFSET,
         winner_badge_bg_id: AVATAR_BG_ID_OFFSET,
@@ -1319,8 +1288,6 @@ export class DerbyRoom extends Room<DerbyState> {
       const botJockey = botJockeyId(ps.jockey_skin_id);
       return {
         winner_human_id: 0,
-        winner_hair_id: 0,
-        winner_hair_color: 0,
         winner_jockey_id: botJockey,
         winner_avatar_id: botJockey,
         winner_badge_bg_id: 0,
@@ -1341,8 +1308,6 @@ export class DerbyRoom extends Room<DerbyState> {
 
     return {
       winner_human_id: ps.human_id ?? HUMAN_ID_OFFSET,
-      winner_hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
-      winner_hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
       winner_jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       winner_avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       winner_badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -2004,8 +1969,6 @@ export class DerbyRoom extends Room<DerbyState> {
         is_bot: sid.startsWith("BOT_"),
         jockey_skin_id: ps.jockey_skin_id ?? 0,
         human_id: ps.human_id ?? HUMAN_ID_OFFSET,
-        hair_id: ps.hair_id ?? HAIR_ID_OFFSET,
-        hair_color: ps.hair_color ?? HAIR_COLOR_DEFAULT,
         jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
         avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
         badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -2107,8 +2070,6 @@ export class DerbyRoom extends Room<DerbyState> {
       }
 
       ps.human_id = 0;
-      ps.hair_id = 0;
-      ps.hair_color = 0;
       ps.jockey_id = botJockeyId(ps.jockey_skin_id);
       ps.avatar_id = ps.jockey_id;
       ps.avatar_bg_id = 0;
