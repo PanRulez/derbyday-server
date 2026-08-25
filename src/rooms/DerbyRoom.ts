@@ -495,13 +495,13 @@ export class DerbyRoom extends Room<DerbyState> {
         this.lastActivity.set(client.sessionId, Date.now());
 
         const entry = this.finishedOrder.find(
-          (item) => item.sid === client.sessionId && item.position >= 1 && item.position <= 3
+          (item) => item.sid === client.sessionId && item.position === 1
         );
         if (!entry) {
           client.send("chest_award_failed", {
             matchId: this.matchId ?? "",
             position: 0,
-            error: "NOT_TOP3_FINISHED",
+            error: "NOT_WINNER",
           });
           return;
         }
@@ -1143,8 +1143,10 @@ export class DerbyRoom extends Room<DerbyState> {
     return found ? found.position : 0;
   }
 
+  /** Chi ha diritto al baule: solo il primo. Deve dire la stessa cosa di
+   * `_grantChestForFinishEntry`, altrimenti il client annuncia bauli che non arrivano mai. */
   private _buildChestWinnersPayload(): any[] {
-    return this.finishedOrder.slice(0, 3).map((entry) => ({
+    return this.finishedOrder.slice(0, 1).map((entry) => ({
       position: entry.position,
       sessionId: entry.sid,
       numero_giocatore: entry.numero,
@@ -1572,9 +1574,9 @@ export class DerbyRoom extends Room<DerbyState> {
     }
 
     try {
-      await this._pfGrantChestsToTop3(matchId);
+      await this._pfGrantChestToWinner(matchId);
     } catch (e) {
-      console.error("[CHEST] top3 grant error:", e);
+      console.error("[CHEST] winner grant error:", e);
     }
 
     setTimeout(() => this.disconnect(), 10000);
@@ -1761,14 +1763,12 @@ export class DerbyRoom extends Room<DerbyState> {
     return json?.data?.FunctionResult ?? null;
   }
 
-  private async _pfGrantChestsToTop3(matchId: string): Promise<void> {
-    const top3 = this.finishedOrder.slice(0, 3);
+  /** Il baule lo vince SOLO il primo. Secondo e terzo prendono rank e monete, non il baule. */
+  private async _pfGrantChestToWinner(matchId: string): Promise<void> {
+    const winner = this.finishedOrder[0];
+    if (!winner) return;
 
-    await Promise.all(
-      top3.map(async (entry) => {
-        await this._grantChestForFinishEntry(entry, matchId);
-      })
-    );
+    await this._grantChestForFinishEntry(winner, matchId);
   }
 
   private _chestGrantKey(matchId: string, entry: FinishEntry): string {
@@ -1780,7 +1780,10 @@ export class DerbyRoom extends Room<DerbyState> {
     matchIdOverride: string | null = null
   ): Promise<void> {
     if (entry.isBot) return;
-    if (entry.position < 1 || entry.position > 3) return;
+    // Solo il vincitore. Questa e' l'ultima porta prima di PlayFab: qualunque strada arrivi
+    // qui (arrivo, fine gara, richiesta del client) passa di qua, quindi il controllo sta
+    // qui e non nei chiamanti.
+    if (entry.position !== 1) return;
 
     const matchId = matchIdOverride ?? this.matchId ?? `${this.roomId}-${Date.now()}`;
     const key = this._chestGrantKey(matchId, entry);
