@@ -136,7 +136,140 @@ function shuffleArray<T>(arr: T[]): T[] {
   return copy;
 }
 
+/* =========================
+   RANK_CATALOG (Title Data)
+   =========================
+
+   Le regole delle leghe e la difficolta' degli avversari vivono nel catalogo del gioco,
+   non qui. Prima erano costanti scritte a mano con un commento che diceva "deve restare
+   allineato al catalogo del client": bastava cambiare una soglia in Derby Day Studio
+   perche' il rating calcolato qui smettesse di essere quello mostrato dal gioco, e non lo
+   diceva nessuno.
+
+   Si legge una volta e si tiene in cache, con un rinfresco periodico: cosi' cambiare un
+   gradino e ripubblicare NON richiede di ridispiegare il server. Se PlayFab non risponde
+   si tengono le costanti qui sotto — un server che non parte perche' PlayFab e' lento
+   sarebbe un peggioramento, non un miglioramento. */
+
+type RankCatalogLeague = {
+  rank_id: string;
+  min_rating: number;
+  rating_delta_by_placement: number[];
+  forfeit_penalty: number;
+  bot_difficulty_tier: number;
+  bot_mount_ids: number[];
+};
+
+type RankCatalogDifficulty = {
+  tier: number;
+  target_points_per_minute: number;
+  delay_spread: number;
+  start_delay_sec: number;
+  weight_0: number;
+  weight_1: number;
+  weight_2: number;
+  weight_4: number;
+};
+
+const RANK_CATALOG_KEY = "RANK_CATALOG";
+const RANK_CATALOG_REFRESH_MS = 10 * 60 * 1000;
+
+// Il giro piu' corto che una pallina vera puo' fare, misurato: sotto non si scende, e un
+// gradino che promette piu' di quanto questo consenta gira semplicemente piu' lento.
+const MIN_REALISTIC_DELAY_SEC = 2.3;
+
+let rankCatalogLeagues: RankCatalogLeague[] = [];
+let rankCatalogDifficulties: RankCatalogDifficulty[] = [];
+let rankCatalogFetchedAt = 0;
+let rankCatalogInFlight: Promise<void> | null = null;
+
+async function refreshRankCatalog(force = false): Promise<void> {
+  if (!PF_HOST || !PF_SECRET) return;
+  if (!force && Date.now() - rankCatalogFetchedAt < RANK_CATALOG_REFRESH_MS) return;
+  if (rankCatalogInFlight) return rankCatalogInFlight;
+
+  rankCatalogInFlight = (async () => {
+    try {
+      const response = await fetch(`${PF_HOST}/Server/GetTitleData`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SecretKey": PF_SECRET },
+        body: JSON.stringify({ Keys: [RANK_CATALOG_KEY] }),
+      });
+
+      const json: any = await response.json().catch(() => null);
+      const raw = json?.data?.Data?.[RANK_CATALOG_KEY];
+      if (!raw) return;
+
+      const parsed = JSON.parse(String(raw));
+      const leagues = Array.isArray(parsed?.leagues) ? parsed.leagues : [];
+      const difficulties = Array.isArray(parsed?.difficulties) ? parsed.difficulties : [];
+      if (!leagues.length) return;
+
+      rankCatalogLeagues = leagues.slice().sort(
+        (a: RankCatalogLeague, b: RankCatalogLeague) => (a.min_rating | 0) - (b.min_rating | 0)
+      );
+      rankCatalogDifficulties = difficulties;
+      rankCatalogFetchedAt = Date.now();
+      console.log(
+        `[RANK_CATALOG] letto: ${rankCatalogLeagues.length} leghe, ${rankCatalogDifficulties.length} gradini`
+      );
+    } catch (err) {
+      // Si tiene quello che c'era: meglio numeri vecchi che nessuna gara.
+      console.error("[RANK_CATALOG] lettura fallita:", err);
+    } finally {
+      rankCatalogInFlight = null;
+    }
+  })();
+
+  return rankCatalogInFlight;
+}
+
+function catalogLeagueFor(rating: number): RankCatalogLeague | null {
+  if (!rankCatalogLeagues.length) return null;
+
+  const safeRating = Math.max(RANK_MIN, rating | 0);
+  let selected: RankCatalogLeague | null = null;
+
+  for (const league of rankCatalogLeagues) {
+    if ((league.min_rating | 0) > safeRating) break;
+    selected = league;
+  }
+
+  return selected ?? rankCatalogLeagues[0];
+}
+
+function catalogDifficultyForTier(tier: number): RankCatalogDifficulty | null {
+  if (tier <= 0) return null;
+  return rankCatalogDifficulties.find((d) => (d.tier | 0) === (tier | 0)) ?? null;
+}
+
+/** Quanto vale in media un tiro a questo gradino. I tiri a vuoto stanno nel denominatore e
+ *  non nel numeratore: chi papera vale meno a tiro, quindi per tenere lo stesso ritmo deve
+ *  tirare piu' spesso. E' la meccanica che fa sembrare vivo un avversario invece che
+ *  rallentato. Stesso conto di DifficultyDef.get_points_per_shot() nel gioco. */
+function difficultyPointsPerShot(d: RankCatalogDifficulty): number {
+  const total = (d.weight_0 | 0) + (d.weight_1 | 0) + (d.weight_2 | 0) + (d.weight_4 | 0);
+  if (total <= 0) return 1;
+  return ((d.weight_1 | 0) + 2 * (d.weight_2 | 0) + 4 * (d.weight_4 | 0)) / total;
+}
+
+/** L'attesa media fra un tiro e il successivo, col pavimento. Stesso conto del gioco. */
+function difficultyMeanDelayMs(d: RankCatalogDifficulty): number {
+  const ppm = Math.max(0.5, d.target_points_per_minute || 6);
+  const mean = (difficultyPointsPerShot(d) * 60) / ppm;
+  return Math.max(mean, MIN_REALISTIC_DELAY_SEC) * 1000;
+}
+
 function getRankRule(rating: number): RankLeagueRule {
+  const fromCatalog = catalogLeagueFor(rating);
+  if (fromCatalog) {
+    return {
+      minRating: fromCatalog.min_rating | 0,
+      deltas: fromCatalog.rating_delta_by_placement || [],
+      forfeitPenalty: fromCatalog.forfeit_penalty | 0,
+    };
+  }
+
   const safeRating = Math.max(RANK_MIN, rating | 0);
   let selected = RANK_LEAGUE_RULES[0];
 
@@ -248,6 +381,14 @@ export class DerbyRoom extends Room<DerbyState> {
   leaderboardDirty = false;
 
   bots: BotInfo[] = [];
+
+  // Il rating di chi e' in stanza, per sapere in che lega si corre. Serve solo a scegliere
+  // quanto sono forti i bot: i delta di rating restano di ciascuno, presi dalla PROPRIA
+  // lega. Gli avversari invece sono condivisi, quindi il gradino dev'essere uno solo, e si
+  // prende quello del giocatore piu' in alto: in una modalita' con classifica una gara dura
+  // e' meglio di una gara vuota.
+  ratingBySid: Map<string, number> = new Map();
+
   finishedOrder: FinishEntry[] = [];
   matchId: string | null = null;
 
@@ -298,6 +439,11 @@ export class DerbyRoom extends Room<DerbyState> {
   private chestGrantDone = new Set<string>();
 
   onCreate(): void {
+    // Il catalogo si chiede qui e non blocca niente: se arriva in tempo la gara usa i
+    // gradini veri, se no parte lo stesso con le costanti di ripiego. La cache e' condivisa
+    // fra tutte le stanze, quindi solo la prima paga la chiamata.
+    void refreshRankCatalog();
+
     this.setState(new DerbyState());
     this.autoDispose = true;
 
@@ -815,6 +961,9 @@ export class DerbyRoom extends Room<DerbyState> {
 
       this._pfGetRank(pfid)
         .then((curRank) => {
+          // Serve al gradino dei bot, oltre che al client.
+          this.ratingBySid.set(client.sessionId, (curRank ?? 0) | 0);
+
           client.send("rank_sync", {
             matchId: "",
             previous_value: (curRank ?? 0) | 0,
@@ -858,6 +1007,10 @@ export class DerbyRoom extends Room<DerbyState> {
   }
 
   async onLeave(client: Client): Promise<void> {
+    // Chi esce smette di contare per la lega della stanza: se restasse, un giocatore di
+    // vertice affacciatosi un attimo lascerebbe i suoi bot addosso a chi resta.
+    this.ratingBySid.delete(client.sessionId);
+
     try {
       if (this._isForfeitEligible(client.sessionId)) {
         await this._applyForfeitPenalty(client.sessionId).catch((e) =>
@@ -1430,13 +1583,52 @@ export class DerbyRoom extends Room<DerbyState> {
   /* =========================
      Bots
      ========================= */
+  /** Il gradino di questa gara: quello della lega del giocatore piu' in alto. Zero se il
+   *  catalogo non e' arrivato, e allora valgono le costanti di ripiego. */
+  private _difficultyForRace(): RankCatalogDifficulty | null {
+    let topRating = 0;
+    this.ratingBySid.forEach((rating) => {
+      if (rating > topRating) topRating = rating;
+    });
+
+    const league = catalogLeagueFor(topRating);
+    if (!league) return null;
+
+    return catalogDifficultyForTier(league.bot_difficulty_tier | 0);
+  }
+
   private _runBots(): void {
-    const totalW = BOT_WEIGHTS.reduce((a, b) => a + b.w, 0);
+    const difficulty = this._difficultyForRace();
+
+    // La mira: dal gradino se c'e', se no quella di serie. `weight_0` e' il tiro a vuoto —
+    // prima non esisteva proprio e ogni tiro di ogni bot imbucava, sempre. In Rank la
+    // papera non costa niente a nessuno, ma esiste: un avversario che non sbaglia mai un
+    // colpo si riconosce subito per quello che e'.
+    const weights = difficulty
+      ? [
+          { s: 0, w: difficulty.weight_0 | 0 },
+          { s: 1, w: difficulty.weight_1 | 0 },
+          { s: 2, w: difficulty.weight_2 | 0 },
+          { s: 4, w: difficulty.weight_4 | 0 },
+        ]
+      : BOT_WEIGHTS;
+
+    const totalW = weights.reduce((a, b) => a + b.w, 0) || 1;
+
+    // La cadenza: ricavata dal ritmo promesso dal gradino, non piu' un intervallo fisso
+    // uguale per tutte le leghe. La dispersione resta per posta, cosi' i bot non partono
+    // tutti insieme.
+    const meanMs = difficulty ? difficultyMeanDelayMs(difficulty) : null;
+    const spread = difficulty ? Math.min(0.9, Math.max(0, difficulty.delay_spread || 0)) : 0;
 
     for (const bot of this.bots) {
-      const baseMs =
-        BOT_BASE_MS_MIN +
-        Math.floor(Math.random() * (BOT_BASE_MS_MAX - BOT_BASE_MS_MIN));
+      const baseMs = meanMs
+        ? Math.max(
+            MIN_REALISTIC_DELAY_SEC * 1000,
+            meanMs * (1 - spread) + Math.random() * (2 * spread * meanMs)
+          )
+        : BOT_BASE_MS_MIN +
+          Math.floor(Math.random() * (BOT_BASE_MS_MAX - BOT_BASE_MS_MIN));
 
       const tick = () => {
         if (this.matchTerminato) return;
@@ -1445,15 +1637,19 @@ export class DerbyRoom extends Room<DerbyState> {
         if (!ps) return;
 
         let r = Math.floor(Math.random() * totalW);
-        let pick = 1;
+        let pick = weights[0].s;
 
-        for (const k of BOT_WEIGHTS) {
+        for (const k of weights) {
           if (r < k.w) {
             pick = k.s;
             break;
           }
           r -= k.w;
         }
+
+        // La papera: il tiro e' andato a vuoto, non succede niente. Niente broadcast, cosi'
+        // il client vede quello che vedrebbe in Level — un cavallo che non avanza.
+        if (pick <= 0) return;
 
         const old = ps.punti;
         ps.punti = Math.min(ps.punti + pick, this.puntiVittoria);
