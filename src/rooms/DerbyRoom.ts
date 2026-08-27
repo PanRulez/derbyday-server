@@ -89,16 +89,26 @@ const BOT_MOUNT_SKINS_COUNT = 12;
 const BOT_JOCKEY_SKINS_COUNT = 6;
 
 const BOT_NAMES = [
-  "Alberto",
-  "Matteo",
-  "Michele",
-  "Lisa",
-  "Ermes",
-  "Marco",
-  "Cristina",
-  "Monica",
-  "Alessandro",
-  "Lillo",
+  "DUSTRIDER77",
+  "MAVERICK_09",
+  "K1DCACTUS",
+  "SPURS4LIFE",
+  "REDDUST44",
+  "SADDLEUP99",
+  "NIGHTMARE23",
+  "LUCKY_HOOF",
+  "TX_RANGER8",
+  "BRONCO_X",
+  "GALLOP3R",
+  "IRONHOOF12",
+  "WILDCARD_7",
+  "HAYMAKER01",
+  "SILVERMANE5",
+  "RODEO_KING",
+  "THUNDERB0LT",
+  "QUICKDRAW66",
+  "MUSTANG_88",
+  "ACE0FSPURS",
 ];
 
 /* =========================
