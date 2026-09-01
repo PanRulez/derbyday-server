@@ -84,9 +84,26 @@ const BOT_START_DELAY_MS = 4500;
 
 /* =========================
    Bot cosmetics / names
-   ========================= */
+   =========================
+
+   Un avversario si presenta come un giocatore: volto, divisa, cavalcatura, badge. Chi puo'
+   indossare cosa lo dice la LEGA (`bot_human_ids`, `bot_divisa_ids`, `bot_mount_ids`,
+   `bot_badge_ids` nel RANK_CATALOG): e' cosi' che si vede la scalata, con gli avversari
+   delle leghe alte su bestie e divise che in basso non si incontrano.
+
+   Le liste qui sotto valgono SOLO quando il catalogo non e' ancora arrivato. Prima al posto
+   di tutto questo c'era un indice di skin 0-5 e il client si inventava il resto: volto e
+   badge di serie, e un caschetto 3001 che non esiste in catalogo — motivo per cui il
+   vincitore bot appariva a testa nuda nel cartiglio e col caschetto in corsia. */
 const BOT_MOUNT_SKINS_COUNT = 12;
-const BOT_JOCKEY_SKINS_COUNT = 6;
+
+// I sei volti: tre maschili (1000-1002) e tre femminili (1003-1005), uno per carnagione.
+const BOT_HUMAN_IDS_FALLBACK = [1000, 1001, 1002, 1003, 1004, 1005];
+
+// Le divise COMPLETE. L'id e' quello del caschetto e la giubba la ricava il client dalla
+// sua tabella (`Script/DivisaPairs.gd`): la coppia vive in un posto solo, e un avversario
+// non puo' finire in giubba senza caschetto. La 3008 (bombetta) non ha ancora la giubba.
+const BOT_DIVISA_IDS_FALLBACK = [3000, 3002, 3003, 3004, 3005, 3006, 3007];
 
 const BOT_NAMES = [
   "DUSTRIDER77",
@@ -115,6 +132,7 @@ const BOT_NAMES = [
    Badge composition defaults
    ========================= */
 const HUMAN_ID_OFFSET = 1000;
+const DIVISA_ID_OFFSET = 3000;
 const JOCKEY_ID_OFFSET = 4000;
 const AVATAR_ID_OFFSET = JOCKEY_ID_OFFSET; // legacy alias for jockey_id
 const AVATAR_BG_ID_OFFSET = 7000;
@@ -167,7 +185,11 @@ type RankCatalogLeague = {
   rating_delta_by_placement: number[];
   forfeit_penalty: number;
   bot_difficulty_tier: number;
+  // Come si presentano gli avversari di questa lega. Vuote = quelle di ripiego qui sopra.
   bot_mount_ids: number[];
+  bot_human_ids: number[];
+  bot_divisa_ids: number[];
+  bot_badge_ids: number[];
 };
 
 type RankCatalogDifficulty = {
@@ -327,8 +349,27 @@ async function authenticatePlayFabSessionTicket(sessionTicket: string): Promise<
   return { playfabId };
 }
 
-function botJockeyId(jockeySkinId: number): number {
-  return JOCKEY_ID_OFFSET + Math.max(0, jockeySkinId | 0);
+/** Gli id di un intervallo, ripuliti. Fuori intervallo = scartato, non corretto: un id
+ *  sbagliato nel catalogo deve sparire, non diventare un altro cosmetico a caso. */
+function idsInRange(values: any, min: number, max: number): number[] {
+  if (!Array.isArray(values)) return [];
+  const out: number[] = [];
+  for (const value of values) {
+    const id = safeNum(value, 0) | 0;
+    if (id >= min && id <= max && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/** Pesca dalla lista, saltando quello che e' gia' addosso a qualcun altro finche' si puo':
+ *  sei avversari vestiti uguali sono sei copie della stessa persona. */
+function pickDistinct(pool: number[], used: Set<number>): number {
+  if (!pool.length) return 0;
+  const free = pool.filter((id) => !used.has(id));
+  const source = free.length ? free : pool;
+  const picked = source[randomInt(0, source.length - 1)];
+  used.add(picked);
+  return picked;
 }
 
 /* =========================
@@ -352,6 +393,18 @@ class PlayerState extends Schema {
 
   @type("number") human_id: number = HUMAN_ID_OFFSET;
   @type("number") jockey_id: number = JOCKEY_ID_OFFSET;
+
+  // La divisa (caschetto + giubba) e' UN cosmetico solo e il suo id e' quello del
+  // caschetto: la giubba la ricava il client da `DivisaPairs`.
+  //
+  // **NON e' un campo dello schema, e non deve diventarlo.** Lo schema si decodifica per
+  // POSIZIONE e i client gia' installati conoscono i quattordici campi di prima: un
+  // quindicesimo li manderebbe a leggere un indice che per loro non esiste, e in una build
+  // di release l'assert che dovrebbe fermarli non c'e' nemmeno - il flusso si sfasa e la
+  // gara si pianta. Qui la divisa serve solo a comporre i messaggi (skins_snapshot,
+  // jockey_skin_update, leaderboard, gara_finita), che sono dizionari: una chiave in piu'
+  // un client vecchio la ignora e basta.
+  divisa_id: number = DIVISA_ID_OFFSET;
 }
 
 class DerbyState extends Schema {
@@ -423,6 +476,7 @@ export class DerbyRoom extends Room<DerbyState> {
     string,
     {
       human_id: number;
+      divisa_id: number;
       jockey_id: number;
       avatar_id: number;
       avatar_bg_id: number;
@@ -574,6 +628,8 @@ export class DerbyRoom extends Room<DerbyState> {
         client,
         msg: {
           human_id?: number;
+          divisa_id?: number;
+          hat_id?: number;
           jockey_id?: number;
           avatar_id?: number;
           badge_bg_id?: number;
@@ -598,6 +654,13 @@ export class DerbyRoom extends Room<DerbyState> {
             JOCKEY_ID_OFFSET,
             safeNum(msg?.jockey_id, JOCKEY_ID_OFFSET) | 0
           );
+          // `hat_id` e' il nome vecchio della divisa: il client lo manda ancora, e finche'
+          // lo fa vale quanto `divisa_id`. Prima il server lo buttava via, e cosi' il
+          // caschetto di un avversario umano non arrivava a nessuno.
+          p.divisa_id = Math.max(
+            DIVISA_ID_OFFSET,
+            safeNum(msg?.divisa_id ?? msg?.hat_id, DIVISA_ID_OFFSET) | 0
+          );
           p.avatar_id = Math.max(
             AVATAR_ID_OFFSET,
             safeNum(msg?.avatar_id, p.jockey_id) | 0
@@ -619,6 +682,7 @@ export class DerbyRoom extends Room<DerbyState> {
             sessionId: client.sessionId,
             numero_giocatore: p.numero_giocatore,
             human_id: p.human_id,
+            divisa_id: p.divisa_id,
             jockey_id: p.jockey_id,
             avatar_id: p.avatar_id,
             badge_bg_id: p.avatar_bg_id,
@@ -997,6 +1061,7 @@ export class DerbyRoom extends Room<DerbyState> {
         mount_skin_id: ps.mount_skin_id ?? 0,
         jockey_skin_id: ps.jockey_skin_id ?? 0,
         human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+        divisa_id: ps.divisa_id ?? DIVISA_ID_OFFSET,
         jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
         avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
         badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1201,6 +1266,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     this.finishCosmeticsBySid.set(sid, {
       human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+      divisa_id: ps.divisa_id ?? DIVISA_ID_OFFSET,
       jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       avatar_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1217,6 +1283,7 @@ export class DerbyRoom extends Room<DerbyState> {
       punti: entry.punti,
       is_bot: entry.isBot,
       human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+      divisa_id: ps.divisa_id ?? DIVISA_ID_OFFSET,
       jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1392,6 +1459,7 @@ export class DerbyRoom extends Room<DerbyState> {
     winnerSid: string
   ): Promise<{
     winner_human_id: number;
+    winner_divisa_id: number;
     winner_jockey_id: number;
     winner_avatar_id: number;
     winner_badge_bg_id: number;
@@ -1423,6 +1491,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
         return {
           winner_human_id: snap.human_id,
+          winner_divisa_id: snap.divisa_id,
           winner_jockey_id: snap.jockey_id,
           winner_avatar_id: snap.avatar_id,
           winner_badge_bg_id: snap.avatar_bg_id,
@@ -1437,6 +1506,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
       return {
         winner_human_id: HUMAN_ID_OFFSET,
+        winner_divisa_id: DIVISA_ID_OFFSET,
         winner_jockey_id: JOCKEY_ID_OFFSET,
         winner_avatar_id: AVATAR_ID_OFFSET,
         winner_badge_bg_id: AVATAR_BG_ID_OFFSET,
@@ -1449,22 +1519,9 @@ export class DerbyRoom extends Room<DerbyState> {
       };
     }
 
-    if (winnerSid.startsWith("BOT_")) {
-      const botJockey = botJockeyId(ps.jockey_skin_id);
-      return {
-        winner_human_id: 0,
-        winner_jockey_id: botJockey,
-        winner_avatar_id: botJockey,
-        winner_badge_bg_id: 0,
-        winner_badge_plate_id: 0,
-        winner_badge_frame_id: 0,
-        winner_avatar_bg_id: 0,
-        winner_plate_id: 0,
-        winner_frame_id: 0,
-        winner_rank: 0,
-      };
-    }
-
+    // Il ramo dei bot non c'e' piu': un avversario ha addosso id veri come chiunque altro,
+    // quindi si legge il suo PlayerState come si legge quello di un giocatore. Prima qui
+    // uscivano nove zeri e il cartiglio se lo inventava il client.
     let rank = 0;
     const pfid = this.sid2pf.get(winnerSid);
     if (pfid) {
@@ -1473,6 +1530,7 @@ export class DerbyRoom extends Room<DerbyState> {
 
     return {
       winner_human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+      winner_divisa_id: ps.divisa_id ?? DIVISA_ID_OFFSET,
       winner_jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
       winner_avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
       winner_badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -1597,13 +1655,17 @@ export class DerbyRoom extends Room<DerbyState> {
      ========================= */
   /** Il gradino di questa gara: quello della lega del giocatore piu' in alto. Zero se il
    *  catalogo non e' arrivato, e allora valgono le costanti di ripiego. */
-  private _difficultyForRace(): RankCatalogDifficulty | null {
+  private _leagueForRace(): RankCatalogLeague | null {
     let topRating = 0;
     this.ratingBySid.forEach((rating) => {
       if (rating > topRating) topRating = rating;
     });
 
-    const league = catalogLeagueFor(topRating);
+    return catalogLeagueFor(topRating);
+  }
+
+  private _difficultyForRace(): RankCatalogDifficulty | null {
+    const league = this._leagueForRace();
     if (!league) return null;
 
     return catalogDifficultyForTier(league.bot_difficulty_tier | 0);
@@ -2178,6 +2240,7 @@ export class DerbyRoom extends Room<DerbyState> {
         is_bot: sid.startsWith("BOT_"),
         jockey_skin_id: ps.jockey_skin_id ?? 0,
         human_id: ps.human_id ?? HUMAN_ID_OFFSET,
+        divisa_id: ps.divisa_id ?? DIVISA_ID_OFFSET,
         jockey_id: ps.jockey_id ?? JOCKEY_ID_OFFSET,
         avatar_id: ps.avatar_id ?? AVATAR_ID_OFFSET,
         badge_bg_id: ps.avatar_bg_id ?? AVATAR_BG_ID_OFFSET,
@@ -2233,30 +2296,48 @@ export class DerbyRoom extends Room<DerbyState> {
     return 1;
   }
 
+  /** Chi puo' indossare cosa in questa gara: lo dice la lega, e se il catalogo non e'
+   *  arrivato valgono le liste di ripiego. Vuota nel catalogo = "tutte quelle di ripiego",
+   *  la stessa regola che `RankDef` documenta per le cavalcature. */
+  private _botLookPools(): {
+    humans: number[];
+    divise: number[];
+    mounts: number[];
+    badges: number[];
+  } {
+    const league = this._leagueForRace();
+
+    const humans = idsInRange(league?.bot_human_ids, 1000, 1999);
+    const divise = idsInRange(league?.bot_divisa_ids, 3000, 3999);
+    const mounts = idsInRange(league?.bot_mount_ids, 5000, 5999);
+    const badges = idsInRange(league?.bot_badge_ids, 7000, 9999);
+
+    return {
+      humans: humans.length ? humans : BOT_HUMAN_IDS_FALLBACK,
+      divise: divise.length ? divise : BOT_DIVISA_IDS_FALLBACK,
+      mounts,
+      badges,
+    };
+  }
+
   private _spawnBotsIfNeeded(): void {
     const usedNumbers = new Set<number>();
     this.state.players.forEach((ps) => usedNumbers.add(ps.numero_giocatore));
 
     const availableBotNames = shuffleArray(BOT_NAMES);
+    const pools = this._botLookPools();
 
-    const usedHumanJockeySkins = new Set<number>();
-    this.state.players.forEach((ps, sid) => {
-      if (!sid.startsWith("BOT_")) {
-        const skin = safeNum(ps.jockey_skin_id, -1) | 0;
-        if (skin >= 0 && skin < BOT_JOCKEY_SKINS_COUNT) {
-          usedHumanJockeySkins.add(skin);
-        }
-      }
+    // Le divise gia' in pista, quelle dei giocatori comprese: un avversario vestito come te
+    // in corsia si confonde col tuo cavallo, ed e' il difetto che il vecchio giro di skin
+    // 0-5 evitava a mano.
+    const usedDivise = new Set<number>();
+    this.state.players.forEach((ps) => {
+      const divisa = safeNum(ps.divisa_id, 0) | 0;
+      if (divisa >= 3000 && divisa <= 3999) usedDivise.add(divisa);
     });
 
-    const availableBotJockeySkins: number[] = [];
-    for (let i = 0; i < BOT_JOCKEY_SKINS_COUNT; i++) {
-      if (!usedHumanJockeySkins.has(i)) {
-        availableBotJockeySkins.push(i);
-      }
-    }
-
-    const shuffledJockeyPool = shuffleArray(availableBotJockeySkins);
+    const usedHumans = new Set<number>();
+    const usedMounts = new Set<number>();
 
     for (let i = 1; i <= this.maxClients; i++) {
       if (usedNumbers.has(i)) continue;
@@ -2270,20 +2351,34 @@ export class DerbyRoom extends Room<DerbyState> {
           ? availableBotNames.shift()!
           : `BOT ${i}`;
 
-      ps.mount_skin_id = randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
+      // La cavalcatura viaggia come INDICE (0 = 5000): e' il protocollo della corsia, dove
+      // il client somma l'indice al suo offset.
+      ps.mount_skin_id = pools.mounts.length
+        ? pickDistinct(pools.mounts, usedMounts) - 5000
+        : randomInt(0, BOT_MOUNT_SKINS_COUNT - 1);
 
-      if (shuffledJockeyPool.length > 0) {
-        ps.jockey_skin_id = shuffledJockeyPool.shift()!;
-      } else {
-        ps.jockey_skin_id = randomInt(0, BOT_JOCKEY_SKINS_COUNT - 1);
-      }
+      ps.human_id = pickDistinct(pools.humans, usedHumans);
+      ps.divisa_id = pickDistinct(pools.divise, usedDivise);
 
-      ps.human_id = 0;
-      ps.jockey_id = botJockeyId(ps.jockey_skin_id);
-      ps.avatar_id = ps.jockey_id;
-      ps.avatar_bg_id = 0;
-      ps.plate_id = 0;
-      ps.frame_id = 0;
+      // La giubba la ricava il client dalla divisa (`DivisaPairs`): la tabella delle coppie
+      // vive in un posto solo, e non e' questo. Zero significa "guarda la divisa".
+      ps.jockey_id = 0;
+      ps.avatar_id = 0;
+      ps.jockey_skin_id = 0;
+
+      const badgeBg = idsInRange(pools.badges, 7000, 7999);
+      const badgeFrame = idsInRange(pools.badges, 8000, 8999);
+      const badgePlate = idsInRange(pools.badges, 9000, 9999);
+
+      ps.avatar_bg_id = badgeBg.length
+        ? badgeBg[randomInt(0, badgeBg.length - 1)]
+        : AVATAR_BG_ID_OFFSET;
+      ps.frame_id = badgeFrame.length
+        ? badgeFrame[randomInt(0, badgeFrame.length - 1)]
+        : FRAME_ID_OFFSET;
+      ps.plate_id = badgePlate.length
+        ? badgePlate[randomInt(0, badgePlate.length - 1)]
+        : PLATE_ID_OFFSET;
 
       this.state.players.set(sid, ps);
       this.bots.push({ sid, numero: i });
@@ -2294,10 +2389,19 @@ export class DerbyRoom extends Room<DerbyState> {
         skin_id: ps.mount_skin_id,
       });
 
+      // Stesso messaggio di prima, con dentro l'identikit vero. `skin_id` resta per i client
+      // vecchi, che sanno leggere solo quello; chi capisce `divisa_id` usa quello e ignora
+      // l'indice.
       this.broadcast("jockey_skin_update", {
         sessionId: sid,
         numero_giocatore: ps.numero_giocatore,
         skin_id: ps.jockey_skin_id,
+        is_bot: true,
+        human_id: ps.human_id,
+        divisa_id: ps.divisa_id,
+        badge_bg_id: ps.avatar_bg_id,
+        badge_frame_id: ps.frame_id,
+        badge_plate_id: ps.plate_id,
       });
     }
 
