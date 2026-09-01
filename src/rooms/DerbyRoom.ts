@@ -2364,7 +2364,13 @@ export class DerbyRoom extends Room<DerbyState> {
       // vive in un posto solo, e non e' questo. Zero significa "guarda la divisa".
       ps.jockey_id = 0;
       ps.avatar_id = 0;
-      ps.jockey_skin_id = 0;
+
+      // L'indice di skin non serve piu' a chi capisce la divisa, ma i client GIA'
+      // INSTALLATI sanno leggere solo questo: lasciandolo a zero vedrebbero i cinque
+      // avversari vestiti tutti uguali, che prima non succedeva. Si ricava dalla divisa,
+      // cosi' resta vario e stabile senza che il server sappia gli abbinamenti.
+      const posto = pools.divise.indexOf(ps.divisa_id);
+      ps.jockey_skin_id = Math.max(0, posto) % 6;
 
       const badgeBg = idsInRange(pools.badges, 7000, 7999);
       const badgeFrame = idsInRange(pools.badges, 8000, 8999);
